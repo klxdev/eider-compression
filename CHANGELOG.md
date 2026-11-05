@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 First version (Eider 0.7.3, klxdev/eider-lang #37).
 
