@@ -1,0 +1,90 @@
+//! compression: deflate (RFC 1951), zlib (RFC 1950), gzip (RFC 1952) and zstd (RFC 8878) in
+//! pure Eider, as whole buffers and as streams that work chunk by chunk.
+//!
+//! This module holds what every codec shares: the `Error` a decoder returns (decoding
+//! hostile input never traps; every failure is an `Err` naming the kind and the byte
+//! offset), and the `Limits` that keep a decompression bomb from taking the process's memory.
+//! The codecs are modules of their own:
+//!
+//! - `compression.checksum`: CRC-32, Adler-32 and XXH64, whole or incremental.
+//! - `compression.deflate`: raw deflate, `Inflater` and `Deflater` (levels 0 to 9).
+//! - `compression.zlib`, `compression.gzip`: the framings, with `Decoder` and `Encoder`.
+//! - `compression.zstd`: zstd frames, `Decoder` and `Encoder`.
+//! - `compression.codec`: one interface over all four, chosen by a Content-Encoding name.
+//! - `compression.streams`: `std/stream` Readers and Writers that decode and encode.
+//!
+//! Limits (`Limits`) apply to every decoder, in whole-buffer and streaming use alike, and
+//! are checked before the bytes are produced: a decoder never holds more than `max_output`
+//! bytes of one stream, whatever the input says.
+
+/// What went wrong.
+pub type Kind =
+    | Truncated
+    | Corrupt
+    | Checksum
+    | TooLarge
+    | RatioExceeded
+    | Unsupported
+    | Trailing
+    | Dictionary
+    | Closed
+
+/// A decoding error: its kind, a message for people, and the offset in the input (counted
+/// from the first byte fed to the decoder) where it was found.
+///
+/// - `Truncated`: the input ended inside the stream.
+/// - `Corrupt`: the data is not valid for the format.
+/// - `Checksum`: a CRC-32, Adler-32 or XXH64 does not match, or a stored length is wrong.
+/// - `TooLarge`: the output would pass `Limits.max_output` (or the stream's window passes
+///   `Limits.max_window`).
+/// - `RatioExceeded`: the output passes `Limits.max_ratio` times the input read.
+/// - `Unsupported`: valid but not handled (a zstd dictionary, a gzip header's reserved bits).
+/// - `Trailing`: bytes follow the end of the stream where none may.
+/// - `Dictionary`: a preset dictionary is needed or is the wrong one.
+/// - `Closed`: the decoder or encoder was used after it finished or failed.
+pub type Error = { kind: Kind, message: String, offset: u64 }
+
+impl Show for Error {
+    fn show(self, inout out: String) {
+        out.append(self.message.copy())
+        out.push_str(" (")
+        out.append(String.from_int(self.offset as i64))
+        out.push_str(")")
+    }
+}
+
+pub fn error(kind: Kind, message: str, offset: u64) -> Error { Error(kind, String.from(message), offset) }
+
+/// Limits against decompression bombs. A zero field means "no limit" for that check.
+///
+/// - `max_output`: the most bytes one stream (one gzip member, one zstd frame, the whole
+///   stream of a Decoder) may produce.
+/// - `max_ratio`: the output may not pass `max_ratio` times the input read so far, once the
+///   output passes `ratio_floor` bytes. deflate cannot go past 1032 to 1, so only a lower
+///   value limits it; zstd goes far higher.
+/// - `ratio_floor`: below this much output the ratio is not checked (small inputs can
+///   compress very well).
+/// - `max_window`: the largest zstd window a frame may declare (the decoder keeps that much
+///   history).
+/// - `max_header`: the largest gzip header (name, comment, extra field) accepted.
+pub type Limits = { max_output: u64, max_ratio: u64, ratio_floor: u64, max_window: u64, max_header: u64 }
+
+/// The defaults: 64 MiB of output, ratio 1100 above 4 MiB of output, an 8 MiB zstd window,
+/// 64 KiB of gzip header.
+pub fn limits() -> Limits { Limits(67108864, 1100, 4194304, 8388608, 65536) }
+
+/// No limits at all, for input you trust.
+pub fn unlimited() -> Limits { Limits(0, 0, 0, 0, 65536) }
+
+/// `limits()` with a different `max_output`.
+pub fn limit_output(max_output: u64) -> Limits {
+    let mut l = limits()
+    l.max_output = max_output
+    l
+}
+
+/// The size of the window deflate may refer back to.
+pub const DEFLATE_WINDOW: usize = 32768
+
+/// The least a Decoder can promise about the ratio of deflate output to input.
+pub const DEFLATE_MAX_RATIO: u64 = 1032

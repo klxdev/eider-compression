@@ -1,0 +1,62 @@
+import core.sys
+import compression.checksum as ck
+
+fn hex(n: u64) -> String {
+    let mut s = String.from("")
+    let digits = sys.lit("0123456789abcdef")
+    let mut i: i32 = 15
+    let mut started = false
+    while i >= 0 {
+        let d = ((n >> ((i as u64) * 4)) & 15) as usize
+        if d != 0 { started = true }
+        if started { s.push_byte(digits[d]) }
+        i -= 1
+    }
+    if !started { s.push_str("0") }
+    s
+}
+
+fn show(name: str, v: u64) uses io {
+    print("{name} {hex(v)}")
+}
+
+fn pattern(n: usize) -> List[u8] {
+    let mut d: List[u8] = List.new()
+    for i in 0..n { d.push(((i * 7 + i / 13) % 251) as u8) }
+    d
+}
+
+fn main() uses io {
+    show("crc32 empty", ck.crc32(List.new()) as u64)
+    show("crc32 123456789", ck.crc32(sys.lit("123456789")) as u64)
+    show("crc32 fox", ck.crc32(sys.lit("The quick brown fox jumps over the lazy dog")) as u64)
+    show("adler32 empty", ck.adler32(List.new()) as u64)
+    show("adler32 Wikipedia", ck.adler32(sys.lit("Wikipedia")) as u64)
+    show("xxh64 empty", ck.xxh64(List.new()))
+    show("xxh64 a", ck.xxh64(sys.lit("a")))
+    show("xxh64 abc", ck.xxh64(sys.lit("abc")))
+    show("xxh64 fox", ck.xxh64(sys.lit("The quick brown fox jumps over the lazy dog")))
+    let p = pattern(100000)
+    show("crc32 pattern", ck.crc32(p) as u64)
+    show("adler32 pattern", ck.adler32(p) as u64)
+    show("xxh64 pattern", ck.xxh64(p))
+    // incremental: chunks of 1, 3, 31, 33 and 1000 bytes give the same values
+    let sizes: [usize; 5] = [1, 3, 31, 33, 1000]
+    for sz in sizes {
+        let mut c = ck.crc32_new()
+        let mut a = ck.adler32_new()
+        let mut x = ck.xxh64_new()
+        let mut i: usize = 0
+        while i < p.len() {
+            let mut e = i + sz
+            if e > p.len() { e = p.len() }
+            let part = p.slice(i, e)
+            c.update(part)
+            a.update(part)
+            x.update(part)
+            i = e
+        }
+        let ok = c.value() == ck.crc32(p) && a.value() == ck.adler32(p) && x.value() == ck.xxh64(p)
+        print("chunks of {sz}: {ok}")
+    }
+}

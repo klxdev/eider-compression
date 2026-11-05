@@ -1,0 +1,64 @@
+// A command line over the library, for interop checks and benchmarks (scripts/interop.sh).
+//
+//   czip <command> <in> <out> [level]
+//
+// Commands: inflate, deflate, unzlib, zlib, gunzip, gzip, unzstd, zstd. Prints the time taken
+// in milliseconds as "ms N". Exit 1 on an error (printed), 2 on a usage or file error.
+import core.sys
+import std.env
+import std.fs
+import std.strings
+import std.time
+import compression
+import compression.deflate
+
+fn text(b: List[u8]) -> String {
+    match String.from_bytes(b) {
+        Ok(s) => s
+        Err(_) => String.from("?")
+    }
+}
+
+fn main() uses io, fs, clock {
+    let a = env.args()
+    if a.len() < 4 {
+        print("usage: czip <command> <in> <out> [level]")
+        env.exit(2)
+    }
+    let cmd = text(a[1])
+    let lvl = if a.len() > 4 { text(a[4]) } else { String.from("6") }
+    let data = match fs.read(a[2]) {
+        Ok(d) => d
+        Err(e) => {
+            print("read: {e}")
+            env.exit(2)
+            List.new()
+        }
+    }
+    let t0 = time.mono_ms()
+    let mut out: List[u8] = List.new()
+    let mut err = String.from("")
+    if cmd == String.from("inflate") {
+        match deflate.inflate_with(data, compression.unlimited()) {
+            Ok(o) => { out = o }
+            Err(e) => { err = e.to_string() }
+        }
+    } else if cmd == String.from("deflate") {
+        out = deflate.deflate(data, strings.parse_i32(lvl).unwrap())
+    } else {
+        err = String.from("unknown command")
+    }
+    let t1 = time.mono_ms()
+    if err != String.from("") {
+        print("error: {err}")
+        env.exit(1)
+    }
+    match fs.write(a[3], out) {
+        Ok(_) => {}
+        Err(e) => {
+            print("write: {e}")
+            env.exit(2)
+        }
+    }
+    print("ms {t1 - t0}")
+}

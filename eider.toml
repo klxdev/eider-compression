@@ -1,0 +1,5 @@
+[package]
+name = "compression"
+version = "0.7.0"
+eider = "0.7"
+description = "Compression in pure Eider: deflate (RFC 1951), zlib and gzip with CRC-32 and Adler-32, and zstd (RFC 8878), as whole buffers and as streams, with limits against decompression bombs"

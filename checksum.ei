@@ -1,0 +1,224 @@
+//! compression.checksum: CRC-32 (gzip, zip, png), Adler-32 (zlib) and XXH64 (zstd's content
+//! checksum), each whole-buffer (`crc32(data)`) and incremental (`Crc32`, `Adler32`, `Xxh64`:
+//! `update` with chunks, `value`). Pure Eider, no capabilities.
+
+/// The CRC-32 lookup table (slicing-by-4: four tables of 256 entries, 1024 in a row).
+pub fn crc_tables() -> List[u32] {
+    let mut t: List[u32] = List.new()
+    for n in 0..256 {
+        let mut c: u32 = n as u32
+        for k in 0..8 {
+            if (c & 1) != 0 { c = 0xEDB88320 ^ (c >> 1) } else { c = c >> 1 }
+        }
+        t.push(c)
+    }
+    for k in 1..4 {
+        for n in 0..256 {
+            let prev = t[((k - 1) * 256 + n) as usize]
+            t.push(t[(prev & 0xFF) as usize] ^ (prev >> 8))
+        }
+    }
+    t
+}
+
+/// An incremental CRC-32 (IEEE 802.3, the one gzip and zip use).
+pub type Crc32 = { t: List[u32], c: u32, n: u64 }
+
+pub fn crc32_new() -> Crc32 { Crc32(crc_tables(), 0xFFFFFFFF, 0) }
+
+impl Crc32 {
+    /// Adds bytes.
+    fn update(inout self, data: List[u8]) {
+        let mut c = self.c.copy()
+        let len = data.len()
+        let mut i: usize = 0
+        while i + 4 <= len {
+            c = c ^ ((data[i] as u32) | ((data[i + 1] as u32) << 8) | ((data[i + 2] as u32) << 16) | ((data[i + 3] as u32) << 24))
+            c = self.t[768 + (c & 0xFF) as usize] ^ self.t[512 + ((c >> 8) & 0xFF) as usize] ^ self.t[256 + ((c >> 16) & 0xFF) as usize] ^ self.t[(c >> 24) as usize]
+            i += 4
+        }
+        while i < len {
+            c = self.t[((c ^ (data[i] as u32)) & 0xFF) as usize] ^ (c >> 8)
+            i += 1
+        }
+        self.c = c
+        self.n += len as u64
+    }
+
+    /// The CRC of the bytes added so far.
+    fn value(self) -> u32 { self.c ^ 0xFFFFFFFF }
+
+    /// How many bytes were added.
+    fn count(self) -> u64 { self.n }
+
+    fn reset(inout self) {
+        self.c = 0xFFFFFFFF
+        self.n = 0
+    }
+}
+
+/// The CRC-32 of `data`.
+pub fn crc32(data: List[u8]) -> u32 {
+    let mut c = crc32_new()
+    c.update(data)
+    c.value()
+}
+
+/// An incremental Adler-32.
+pub type Adler32 = { a: u32, b: u32 }
+
+pub fn adler32_new() -> Adler32 { Adler32(1, 0) }
+
+impl Adler32 {
+    fn update(inout self, data: List[u8]) {
+        let mut a = self.a.copy()
+        let mut b = self.b.copy()
+        let len = data.len()
+        let mut i: usize = 0
+        while i < len {
+            // 5552 is the most bytes that cannot overflow a u32 before the reduction
+            let mut stop = i + 5552
+            if stop > len { stop = len }
+            while i < stop {
+                a += data[i] as u32
+                b += a
+                i += 1
+            }
+            a = a % 65521
+            b = b % 65521
+        }
+        self.a = a
+        self.b = b
+    }
+
+    fn value(self) -> u32 { (self.b << 16) | self.a }
+
+    fn reset(inout self) {
+        self.a = 1
+        self.b = 0
+    }
+}
+
+/// The Adler-32 of `data`.
+pub fn adler32(data: List[u8]) -> u32 {
+    let mut s = adler32_new()
+    s.update(data)
+    s.value()
+}
+
+// ---- XXH64
+
+const P1: u64 = 11400714785074694791
+const P2: u64 = 14029467366897019727
+const P3: u64 = 1609587929392839161
+const P4: u64 = 9650029242287828579
+const P5: u64 = 2870177450012600261
+
+fn rotl(x: u64, r: u64) -> u64 { (x << r) | (x >> (64 - r)) }
+
+fn round(acc: u64, input: u64) -> u64 {
+    let a = acc +% (input *% P2)
+    rotl(a, 31) *% P1
+}
+
+fn merge(acc: u64, val: u64) -> u64 {
+    let v = round(0, val)
+    ((acc ^ v) *% P1) +% P4
+}
+
+fn le64(d: List[u8], i: usize) -> u64 {
+    (d[i] as u64) | ((d[i + 1] as u64) << 8) | ((d[i + 2] as u64) << 16) | ((d[i + 3] as u64) << 24) | ((d[i + 4] as u64) << 32) | ((d[i + 5] as u64) << 40) | ((d[i + 6] as u64) << 48) | ((d[i + 7] as u64) << 56)
+}
+
+fn le32(d: List[u8], i: usize) -> u64 {
+    (d[i] as u64) | ((d[i + 1] as u64) << 8) | ((d[i + 2] as u64) << 16) | ((d[i + 3] as u64) << 24)
+}
+
+/// An incremental XXH64 with seed 0 (zstd's frame checksum is its low 32 bits).
+pub type Xxh64 = { v1: u64, v2: u64, v3: u64, v4: u64, total: u64, buf: List[u8] }
+
+pub fn xxh64_new() -> Xxh64 {
+    Xxh64(P1 +% P2, P2, 0, 0 -% P1, 0, List.new())
+}
+
+impl Xxh64 {
+    fn update(inout self, data: List[u8]) {
+        let len = data.len()
+        self.total += len as u64
+        let mut i: usize = 0
+        if self.buf.len() > 0 {
+            while i < len && self.buf.len() < 32 {
+                self.buf.push(data[i])
+                i += 1
+            }
+            if self.buf.len() < 32 { return }
+            let b = self.buf.copy()
+            self.stripe(b, 0)
+            self.buf.clear()
+        }
+        while i + 32 <= len {
+            self.stripe(data, i)
+            i += 32
+        }
+        while i < len {
+            self.buf.push(data[i])
+            i += 1
+        }
+    }
+
+    fn stripe(inout self, d: List[u8], i: usize) {
+        self.v1 = round(self.v1, le64(d, i))
+        self.v2 = round(self.v2, le64(d, i + 8))
+        self.v3 = round(self.v3, le64(d, i + 16))
+        self.v4 = round(self.v4, le64(d, i + 24))
+    }
+
+    /// The 64-bit hash of the bytes added so far.
+    fn value(self) -> u64 {
+        let mut h: u64 = 0
+        if self.total >= 32 {
+            h = rotl(self.v1, 1) +% rotl(self.v2, 7) +% rotl(self.v3, 12) +% rotl(self.v4, 18)
+            h = merge(h, self.v1)
+            h = merge(h, self.v2)
+            h = merge(h, self.v3)
+            h = merge(h, self.v4)
+        } else {
+            h = self.v3 +% P5
+        }
+        h = h +% self.total
+        let d = self.buf
+        let n = d.len()
+        let mut i: usize = 0
+        while i + 8 <= n {
+            h = h ^ round(0, le64(d, i))
+            h = (rotl(h, 27) *% P1) +% P4
+            i += 8
+        }
+        if i + 4 <= n {
+            h = h ^ (le32(d, i) *% P1)
+            h = (rotl(h, 23) *% P2) +% P3
+            i += 4
+        }
+        while i < n {
+            h = h ^ ((d[i] as u64) *% P5)
+            h = rotl(h, 11) *% P1
+            i += 1
+        }
+        h = h ^ (h >> 33)
+        h = h *% P2
+        h = h ^ (h >> 29)
+        h = h *% P3
+        h = h ^ (h >> 32)
+        h
+    }
+
+    /// The low 32 bits, what a zstd frame stores.
+    fn value32(self) -> u32 { (self.value() & 0xFFFFFFFF) as u32 }
+}
+
+/// XXH64 (seed 0) of `data`.
+pub fn xxh64(data: List[u8]) -> u64 {
+    let mut x = xxh64_new()
+    x.update(data)
+    x.value()
+}

@@ -1,0 +1,1343 @@
+//! compression.deflate: raw deflate (RFC 1951).
+//!
+//! Decoding: `inflate(data)` decodes a whole buffer; `Inflater` takes the input in chunks
+//! (`feed`) and appends what it decodes to a List you give it, keeping only the 32 KiB window
+//! between calls. Hostile input never traps: every problem is an `Err(compression.Error)`, and
+//! `compression.Limits` stops a bomb before its output exists.
+//!
+//! Encoding: `deflate(data, level)` encodes a whole buffer; `Deflater` takes chunks (`write`),
+//! can `flush` (a sync flush: everything written so far can be decoded by the peer) and
+//! `finish`. Levels: 0 stores, 1 to 3 are greedy matchers, 4 to 9 lazy ones, with the hash
+//! chain lengths of zlib's table; 6 is the default.
+//!
+//! The Huffman decoder is table driven: one 10-bit lookup for the common codes, canonical
+//! decoding for the rare longer ones. The encoder builds length-limited (15 bit) codes for
+//! every block and picks stored, fixed or dynamic, whichever is smallest.
+
+import std.checked
+import std.sort
+import compression
+import compression.checksum as ck
+
+// ---- tables
+
+fn len_base() -> List[u32] {
+    List[3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+}
+
+fn len_extra() -> List[u32] {
+    List[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+}
+
+fn dist_base() -> List[u32] {
+    List[1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+}
+
+fn dist_extra() -> List[u32] {
+    List[0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+}
+
+/// The order the code length code's lengths are sent in.
+fn clen_order() -> List[u32] {
+    List[16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+}
+
+// ---- Huffman decoding tables
+
+const FAST: u64 = 10
+const FAST_SIZE: usize = 1024
+
+/// A decoding table for one canonical Huffman code: `fast` is indexed by the next 10 bits of
+/// the stream (low bit first) and holds `symbol << 4 | length`, or 0 for a longer code;
+/// `count` and `sym` decode the longer ones (canonical order, as in zlib's puff).
+pub type Huff = { fast: List[u32], count: List[u32], sym: List[u32], total: u32 }
+
+fn huff_empty() -> Huff { Huff(List.filled(0, FAST_SIZE), List.filled(0, 16), List.new(), 0) }
+
+pub fn reverse(code: u32, n: u32) -> u32 {
+    let mut r: u32 = 0
+    let mut c = code.copy()
+    let mut i: u32 = 0
+    while i < n {
+        r = (r << 1) | (c & 1)
+        c = c >> 1
+        i += 1
+    }
+    r
+}
+
+/// The table for the code lengths `lens[lo .. lo + n]`; None if the lengths over-subscribe the
+/// code space or leave it incomplete (one code of length 1 alone is allowed, as in zlib, and so
+/// are no codes at all).
+pub fn huff_build(lens: List[u8], lo: usize, n: usize) -> Option[Huff] {
+    let mut count: List[u32] = List.filled(0, 16)
+    for i in 0..n { count[lens[lo + i] as usize] += 1 }
+    count[0] = 0
+    let mut left: i32 = 1
+    let mut total: u32 = 0
+    for l in 1..16 {
+        left = left * 2 - (count[l as usize] as i32)
+        if left < 0 { return None }
+        total += count[l as usize]
+    }
+    if left > 0 && total != 0 && !(total == 1 && count[1] == 1) { return None }
+    let mut offs: List[u32] = List.filled(0, 17)
+    for l in 1..16 { offs[(l + 1) as usize] = offs[l as usize] + count[l as usize] }
+    let mut next: List[u32] = List.filled(0, 17)
+    let mut code: u32 = 0
+    for l in 1..16 {
+        code = (code + count[(l - 1) as usize]) << 1
+        next[l as usize] = code
+    }
+    let mut fast: List[u32] = List.filled(0, FAST_SIZE)
+    let mut sym: List[u32] = List.filled(0, total as usize)
+    for i in 0..n {
+        let l = lens[lo + i] as usize
+        if l == 0 { continue }
+        sym[offs[l] as usize] = i as u32
+        offs[l] += 1
+        let c = next[l].copy()
+        next[l] += 1
+        if l <= (FAST as usize) {
+            let r = reverse(c, l as u32) as usize
+            let entry = ((i as u32) << 4) | (l as u32)
+            let stride = 1 << l
+            let mut j = r.copy()
+            while j < FAST_SIZE {
+                fast[j] = entry
+                j += stride
+            }
+        }
+    }
+    Some(Huff(fast, count, sym, total))
+}
+
+/// Decodes one symbol of `h` from the low `avail` bits of `bb` the slow way: the packed
+/// `symbol << 4 | length`, -1 for a bit pattern no code has, -2 when more bits are needed.
+fn huff_slow(h: Huff, bb: u64, avail: u64) -> i32 {
+    let mut code: i32 = 0
+    let mut first: i32 = 0
+    let mut index: i32 = 0
+    for len in 1..16 {
+        if (len as u64) > avail { return -2 }
+        code = code | (((bb >> ((len - 1) as u64)) & 1) as i32)
+        let cnt = h.count[len as usize] as i32
+        if code - cnt < first {
+            let s = h.sym[(index + (code - first)) as usize] as i32
+            return (s << 4) | len
+        }
+        index += cnt
+        first += cnt
+        first = first << 1
+        code = code << 1
+    }
+    -1
+}
+
+/// `huff_slow` after the fast table: the same result convention.
+fn huff_decode(h: Huff, bb: u64, avail: u64) -> i32 {
+    let e = h.fast[(bb & 1023) as usize].copy()
+    if e != 0 {
+        if ((e & 15) as u64) > avail { return -2 }
+        return e as i32
+    }
+    huff_slow(h, bb, avail)
+}
+
+fn fixed_lit() -> Huff {
+    let mut lens: List[u8] = List.filled(8, 288)
+    let mut i: usize = 144
+    while i < 256 {
+        lens[i] = 9
+        i += 1
+    }
+    while i < 280 {
+        lens[i] = 7
+        i += 1
+    }
+    huff_build(lens, 0, 288).unwrap()
+}
+
+fn fixed_dist() -> Huff {
+    let lens: List[u8] = List.filled(5, 30)
+    huff_build(lens, 0, 30).unwrap()
+}
+
+// ---- the Inflater
+
+const ST_HEADER: u32 = 0
+const ST_STORED_HEAD: u32 = 1
+const ST_STORED: u32 = 2
+const ST_DYNAMIC: u32 = 3
+const ST_CODES: u32 = 4
+const ST_DONE: u32 = 5
+const ST_FAILED: u32 = 6
+
+/// A deflate decoder fed in chunks. Make one with `inflater(limits)`.
+pub type Inflater = {
+    lim: compression.Limits,
+    inp: List[u8], pos: usize, bb: u64, bc: u64,
+    state: u32, last: bool,
+    hist: List[u8], flushed: usize, out_total: u64, dict_len: usize, keep: bool,
+    lit: Huff, dist: Huff, flit: Huff, fdist: Huff, have_fixed: bool,
+    lbase: List[u32], lextra: List[u32], dbase: List[u32], dextra: List[u32],
+    stored_left: usize, fed: u64, err: Option[compression.Error],
+}
+
+pub fn inflater(lim: compression.Limits) -> Inflater {
+    Inflater(lim, List.new(), 0, 0, 0, ST_HEADER, false, List.new(), 0, 0, 0, false,
+             huff_empty(), huff_empty(), huff_empty(), huff_empty(), false,
+             len_base(), len_extra(), dist_base(), dist_extra(), 0, 0, None)
+}
+
+fn fail(inout s: Inflater, kind: compression.Kind, msg: str) -> compression.Error {
+    s.state = ST_FAILED
+    let e = compression.error(kind, msg, s.offset())
+    s.err = Some(e.copy())
+    e
+}
+
+fn cap_for(lim: compression.Limits, fed: u64) -> u64 {
+    let mut cap: u64 = 18446744073709551615
+    if lim.max_output != 0 { cap = lim.max_output.copy() }
+    if lim.max_ratio != 0 {
+        let by_ratio = match fed.checked_mul(lim.max_ratio) {
+            Some(v) => if v < lim.ratio_floor { lim.ratio_floor.copy() } else { v }
+            None => 18446744073709551615
+        }
+        if by_ratio < cap { cap = by_ratio }
+    }
+    cap
+}
+
+/// Why output of `produced` bytes passes the limits (TooLarge, or the ratio).
+fn over(inout s: Inflater) -> compression.Error {
+    if s.lim.max_output != 0 && cap_for(s.lim, s.fed) == s.lim.max_output {
+        return fail(inout s, compression.TooLarge, "deflate: output over the limit")
+    }
+    fail(inout s, compression.RatioExceeded, "deflate: output over the ratio limit")
+}
+
+impl Inflater {
+    /// Preset dictionary (zlib's FDICT): the data the stream may refer back to before its
+    /// own first byte. Call before the first `feed`.
+    fn set_dictionary(inout self, dict: List[u8]) {
+        let n = dict.len()
+        let from = if n > 32768 { n - 32768 } else { 0 }
+        self.hist = dict.slice(from, n)
+        self.flushed = self.hist.len()
+        self.dict_len = self.hist.len()
+    }
+
+    /// Bytes decoded so far (not counting a preset dictionary).
+    fn produced(self) -> u64 { self.out_total + ((self.hist.len() - self.flushed) as u64) }
+
+    /// The input offset the decoder is at (bytes consumed).
+    fn offset(self) -> u64 { self.fed - ((self.inp.len() - self.pos) as u64) - (self.bc / 8) }
+
+    /// The final block was decoded.
+    fn done(self) -> bool { self.state == ST_DONE }
+
+    /// Input bytes after the end of the stream (valid once `done`).
+    fn rest(self) -> List[u8] { self.inp.slice(self.pos, self.inp.len()) }
+
+    /// Total input bytes taken from the chunks fed, not counting `rest()`.
+    fn consumed(self) -> u64 { self.fed - ((self.inp.len() - self.pos) as u64) - (self.bc / 8) }
+
+    /// Makes at least `n` bits available if the input has them.
+    fn need(inout self, n: u64) -> bool {
+        while self.bc < n && self.pos < self.inp.len() {
+            self.bb = self.bb | ((self.inp[self.pos] as u64) << self.bc)
+            self.pos += 1
+            self.bc += 8
+        }
+        self.bc >= n
+    }
+
+    fn take(inout self, n: u64) -> u32 {
+        let v = (self.bb & ((1 << n) - 1)) as u32
+        self.bb = self.bb >> n
+        self.bc -= n
+        v
+    }
+
+    /// Hands back the whole bytes of the bit buffer to the input (the unused bits of the
+    /// current byte are dropped): the stream is at a byte boundary.
+    fn align(inout self) {
+        let drop = self.bc % 8
+        self.bb = self.bb >> drop
+        self.bc -= drop
+        self.pos -= (self.bc / 8) as usize
+        self.bb = 0
+        self.bc = 0
+    }
+
+    /// Adds a chunk of input, decodes as much as it can, and appends the output to `out`.
+    /// After an `Err` the decoder is finished (later calls say `Closed`); output produced
+    /// before the error is in `out`. After the final block, further input is kept in `rest()`.
+    fn feed(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state == ST_FAILED { return Err(self.closed()) }
+        if self.pos >= self.inp.len() {
+            self.inp = data.copy()
+            self.pos = 0
+        } else if data.len() > 0 {
+            if self.pos > 0 {
+                self.inp.remove_range(0, self.pos)
+                self.pos = 0
+            }
+            self.inp.extend(data)
+        }
+        self.fed += data.len() as u64
+        let r = self.run()
+        if !self.keep { self.flush_into(inout out) }
+        r
+    }
+
+    fn closed(self) -> compression.Error {
+        match self.err {
+            Some(e) => e.copy()
+            None => compression.error(compression.Closed, "deflate: decoder already failed", self.offset())
+        }
+    }
+
+    /// Moves decoded bytes not yet delivered to `out` and trims the window.
+    fn flush_into(inout self, inout out: List[u8]) {
+        let n = self.hist.len()
+        let mut i = self.flushed.copy()
+        while i < n {
+            out.push(self.hist[i])
+            i += 1
+        }
+        self.out_total += (n - self.flushed) as u64
+        self.flushed = n
+        if n > 131072 {
+            self.hist.remove_range(0, n - 32768)
+            self.flushed = 32768
+        }
+    }
+
+    /// The end of the input: Ok when the final block was decoded, `Truncated` otherwise.
+    fn finish(inout self) -> Result[(), compression.Error] {
+        if self.state == ST_FAILED { return Err(self.closed()) }
+        if self.state == ST_DONE { return Ok(()) }
+        Err(fail(inout self, compression.Truncated, "deflate: stream ends before the final block"))
+    }
+
+    // runs the state machine until the input is used up, an error, or the end of the stream
+    fn run(inout self) -> Result[(), compression.Error] {
+        while true {
+            let st = self.state.copy()
+            if st == ST_HEADER {
+                if self.last {
+                    self.align()
+                    self.state = ST_DONE
+                    return Ok(())
+                }
+                if !self.need(3) { return Ok(()) }
+                self.last = self.take(1) == 1
+                let t = self.take(2)
+                if t == 0 {
+                    self.align()
+                    self.state = ST_STORED_HEAD
+                } else if t == 1 {
+                    if !self.have_fixed {
+                        self.flit = fixed_lit()
+                        self.fdist = fixed_dist()
+                        self.have_fixed = true
+                    }
+                    self.lit = self.flit.copy()
+                    self.dist = self.fdist.copy()
+                    self.state = ST_CODES
+                } else if t == 2 {
+                    self.state = ST_DYNAMIC
+                } else {
+                    return Err(fail(inout self, compression.Corrupt, "deflate: invalid block type 3"))
+                }
+            } else if st == ST_STORED_HEAD {
+                if self.inp.len() - self.pos < 4 { return Ok(()) }
+                let p = self.pos.copy()
+                let n = (self.inp[p] as usize) | ((self.inp[p + 1] as usize) << 8)
+                let nn = (self.inp[p + 2] as usize) | ((self.inp[p + 3] as usize) << 8)
+                if n != (nn ^ 65535) {
+                    return Err(fail(inout self, compression.Corrupt, "deflate: stored block length check failed"))
+                }
+                self.pos += 4
+                self.stored_left = n
+                self.state = ST_STORED
+            } else if st == ST_STORED {
+                let avail = self.inp.len() - self.pos
+                let k = if avail < self.stored_left { avail } else { self.stored_left.copy() }
+                let cap = cap_for(self.lim, self.fed)
+                if self.produced() + (k as u64) > cap {
+                    return Err(over(inout self))
+                }
+                let mut i = self.pos.copy()
+                let stop = i + k
+                while i < stop {
+                    self.hist.push(self.inp[i])
+                    i += 1
+                }
+                self.pos = stop
+                self.stored_left -= k
+                if self.stored_left == 0 {
+                    self.state = ST_HEADER
+                } else {
+                    return Ok(())
+                }
+            } else if st == ST_DYNAMIC {
+                match self.dynamic_header() {
+                    Ok(true) => { self.state = ST_CODES }
+                    Ok(false) => { return Ok(()) }
+                    Err(e) => { return Err(e) }
+                }
+            } else if st == ST_CODES {
+                match self.codes() {
+                    Ok(true) => { self.state = ST_HEADER }
+                    Ok(false) => { return Ok(()) }
+                    Err(e) => { return Err(e) }
+                }
+            } else {
+                return Ok(())
+            }
+        }
+        Ok(())
+    }
+
+    // The dynamic block header: Ok(true) when read, Ok(false) when the input ends in it (the
+    // header is read again from its start when more arrives).
+    fn dynamic_header(inout self) -> Result[bool, compression.Error] {
+        let save_pos = self.pos.copy()
+        let save_bb = self.bb.copy()
+        let save_bc = self.bc.copy()
+        if !self.need(14) {
+            return Ok(false)
+        }
+        let hlit = (self.take(5) as usize) + 257
+        let hdist = (self.take(5) as usize) + 1
+        let hclen = (self.take(4) as usize) + 4
+        if hlit > 286 || hdist > 30 {
+            return Err(fail(inout self, compression.Corrupt, "deflate: too many length or distance codes"))
+        }
+        let order = clen_order()
+        let mut cl: List[u8] = List.filled(0, 19)
+        for i in 0..hclen {
+            if !self.need(3) {
+                self.pos = save_pos
+                self.bb = save_bb
+                self.bc = save_bc
+                return Ok(false)
+            }
+            cl[order[i] as usize] = self.take(3) as u8
+        }
+        let clh = match huff_build(cl, 0, 19) {
+            Some(h) => h
+            None => { return Err(fail(inout self, compression.Corrupt, "deflate: invalid code length code")) }
+        }
+        let total = hlit + hdist
+        let mut lens: List[u8] = List.filled(0, total)
+        let mut i: usize = 0
+        while i < total {
+            // 7 bits for the code, then up to 7 of extra bits
+            let _ = self.need(14)
+            let r = huff_decode(clh, self.bb, self.bc)
+            if r == -2 {
+                self.pos = save_pos
+                self.bb = save_bb
+                self.bc = save_bc
+                return Ok(false)
+            }
+            if r < 0 {
+                return Err(fail(inout self, compression.Corrupt, "deflate: invalid code length symbol"))
+            }
+            let sym = (r >> 4) as u32
+            let l = (r & 15) as u64
+            if sym < 16 {
+                self.bb = self.bb >> l
+                self.bc -= l
+                lens[i] = sym as u8
+                i += 1
+            } else {
+                let mut xbits: u64 = 7
+                let mut base: usize = 11
+                if sym == 16 {
+                    xbits = 2
+                    base = 3
+                } else if sym == 17 {
+                    xbits = 3
+                    base = 3
+                }
+                if self.bc < l + xbits {
+                    self.pos = save_pos
+                    self.bb = save_bb
+                    self.bc = save_bc
+                    return Ok(false)
+                }
+                self.bb = self.bb >> l
+                self.bc -= l
+                let rep = (self.take(xbits) as usize) + base
+                if i + rep > total {
+                    return Err(fail(inout self, compression.Corrupt, "deflate: code lengths repeat past the table"))
+                }
+                let mut v: u8 = 0
+                if sym == 16 {
+                    if i == 0 {
+                        return Err(fail(inout self, compression.Corrupt, "deflate: repeat of a code length with none before"))
+                    }
+                    v = lens[i - 1]
+                }
+                let stop = i + rep
+                while i < stop {
+                    lens[i] = v
+                    i += 1
+                }
+            }
+        }
+        if lens[256] == 0 {
+            return Err(fail(inout self, compression.Corrupt, "deflate: no end-of-block code"))
+        }
+        let lh = match huff_build(lens, 0, hlit) {
+            Some(h) => h
+            None => { return Err(fail(inout self, compression.Corrupt, "deflate: invalid literal/length code")) }
+        }
+        let dh = match huff_build(lens, hlit, hdist) {
+            Some(h) => h
+            None => { return Err(fail(inout self, compression.Corrupt, "deflate: invalid distance code")) }
+        }
+        self.lit = lh
+        self.dist = dh
+        Ok(true)
+    }
+
+    // Decodes literals and matches of the current block. Ok(true): the block's end code was
+    // read; Ok(false): the input ran out (the state is at a symbol boundary).
+    fn codes(inout self) -> Result[bool, compression.Error] {
+        let n = self.inp.len()
+        let mut pos = self.pos.copy()
+        let mut bb = self.bb.copy()
+        let mut bc = self.bc.copy()
+        let cap = cap_for(self.lim, self.fed)
+        let mut room: u64 = 0
+        let mut produced = self.produced()
+        if cap > produced { room = cap - produced }
+        let mut made: u64 = 0
+        let mut result = false
+        let mut bad: i32 = 0
+        while true {
+            if bc < 48 {
+                while bc <= 55 && pos < n {
+                    bb = bb | ((self.inp[pos] as u64) << bc)
+                    pos += 1
+                    bc += 8
+                }
+            }
+            let mut e = self.lit.fast[(bb & 1023) as usize].copy()
+            if e == 0 {
+                let r = huff_slow(self.lit, bb, bc)
+                if r == -2 { break }
+                if r < 0 { bad = 1; break }
+                e = r as u32
+            }
+            let mut used = (e & 15) as u64
+            if used > bc { break }
+            let sym = (e >> 4) as usize
+            if sym < 256 {
+                if made >= room { bad = 4; break }
+                self.hist.push(sym as u8)
+                made += 1
+                bb = bb >> used
+                bc -= used
+                continue
+            }
+            if sym == 256 {
+                bb = bb >> used
+                bc -= used
+                result = true
+                break
+            }
+            if sym > 285 { bad = 2; break }
+            let li = sym - 257
+            let lx = self.lextra[li] as u64
+            let length = (self.lbase[li] as usize) + (((bb >> used) & ((1 << lx) - 1)) as usize)
+            used += lx
+            let t = bb >> used
+            let mut de = self.dist.fast[(t & 1023) as usize].copy()
+            if de == 0 {
+                let r = huff_slow(self.dist, t, if bc > used { bc - used } else { 0 })
+                if r == -2 { break }
+                if r < 0 { bad = 3; break }
+                de = r as u32
+            }
+            used += (de & 15) as u64
+            let ds = (de >> 4) as usize
+            if ds > 29 { bad = 3; break }
+            let dx = self.dextra[ds] as u64
+            let dist = (self.dbase[ds] as usize) + (((bb >> used) & ((1 << dx) - 1)) as usize)
+            used += dx
+            if used > bc { break }
+            if dist > self.hist.len() { bad = 5; break }
+            if made + (length as u64) > room { bad = 4; break }
+            bb = bb >> used
+            bc -= used
+            made += length as u64
+            let src = self.hist.len() - dist
+            let mut k: usize = 0
+            while k < length {
+                self.hist.push(self.hist[src + k])
+                k += 1
+            }
+        }
+        self.pos = pos
+        self.bb = bb
+        self.bc = bc
+        if bad == 1 { return Err(fail(inout self, compression.Corrupt, "deflate: invalid literal/length code")) }
+        if bad == 2 { return Err(fail(inout self, compression.Corrupt, "deflate: invalid literal/length symbol")) }
+        if bad == 3 { return Err(fail(inout self, compression.Corrupt, "deflate: invalid distance code")) }
+        if bad == 5 { return Err(fail(inout self, compression.Corrupt, "deflate: distance too far back")) }
+        if bad == 4 { return Err(over(inout self)) }
+        Ok(result)
+    }
+}
+
+/// Decodes the raw deflate stream `data` (all of it, nothing after it).
+pub fn inflate(data: List[u8]) -> Result[List[u8], compression.Error] {
+    inflate_with(data, compression.limits())
+}
+
+/// `inflate` with explicit limits.
+pub fn inflate_with(data: List[u8], lim: compression.Limits) -> Result[List[u8], compression.Error] {
+    let mut s = inflater(lim)
+    s.keep = true
+    let mut sink: List[u8] = List.new()
+    s.feed(data, inout sink)?
+    s.finish()?
+    if s.rest().len() > 0 {
+        return Err(compression.error(compression.Trailing, "deflate: data after the final block", s.consumed()))
+    }
+    Ok(s.hist)
+}
+
+// ---- the encoder
+
+const MIN_MATCH: usize = 3
+const MAX_MATCH: usize = 258
+const WSIZE: usize = 32768
+const WMASK: usize = 32767
+// the farthest back a match may reach (zlib keeps MIN_LOOKAHEAD of the window free)
+const MAX_DIST: usize = 32506
+const MIN_LOOKAHEAD: usize = 262
+const HASH_BITS: u32 = 15
+const HASH_SIZE: usize = 32768
+// the working buffer: window, the longest block, input to come
+const WORK: usize = 196608
+const SYMS_MAX: usize = 32768
+const SPAN_MAX: usize = 60000
+const NL: usize = 286
+const ND: usize = 30
+const NC: usize = 19
+
+/// Canonical code lengths for `freq[0..n]`, none longer than `maxbits`; at least two symbols get
+/// a code (a decoder may refuse a code of one symbol).
+fn code_lengths(freq: List[u32], n: usize, maxbits: usize) -> List[u8] {
+    let mut lens: List[u8] = List.filled(0, n)
+    let mut keys: List[u64] = List.new()
+    for i in 0..n {
+        if freq[i] > 0 { keys.push(((freq[i] as u64) << 16) | (i as u64)) }
+    }
+    let mut pad: usize = 0
+    while keys.len() < 2 {
+        // an unused symbol with weight 1
+        let mut used = false
+        for k in keys {
+            if (k & 65535) == (pad as u64) { used = true }
+        }
+        if !used { keys.push((1 << 16) | (pad as u64)) }
+        pad += 1
+    }
+    let sorted = sort.sort(keys)
+    let m = sorted.len()
+    let mut w: List[u64] = List.filled(0, 2 * m)
+    let mut parent: List[usize] = List.filled(0, 2 * m)
+    for i in 0..m { w[i] = sorted[i] >> 16 }
+    let mut li: usize = 0
+    let mut ii: usize = m.copy()
+    let mut nn: usize = m.copy()
+    for k in 0..(m - 1) {
+        let mut pair: [usize; 2] = [0, 0]
+        let mut t: usize = 0
+        while t < 2 {
+            let take_leaf = if li < m { if ii < nn { w[li] <= w[ii] } else { true } } else { false }
+            if take_leaf {
+                pair[t] = li.copy()
+                li += 1
+            } else {
+                pair[t] = ii.copy()
+                ii += 1
+            }
+            t += 1
+        }
+        w[nn] = w[pair[0]] + w[pair[1]]
+        parent[pair[0]] = nn.copy()
+        parent[pair[1]] = nn.copy()
+        nn += 1
+    }
+    // depths: parents have higher indexes than their children
+    let mut depth: List[usize] = List.filled(0, nn)
+    let mut node: usize = nn - 1
+    while node > 0 {
+        node -= 1
+        depth[node] = depth[parent[node]] + 1
+    }
+    let mut count: List[usize] = List.filled(0, maxbits + 1)
+    for i in 0..m {
+        let d = if depth[i] > maxbits { maxbits } else { depth[i].copy() }
+        count[d] += 1
+    }
+    let mut total: usize = 0
+    for l in 1..(maxbits + 1) { total += count[l] << (maxbits - l) }
+    while total > (1 << maxbits) {
+        count[maxbits] -= 1
+        let mut l = maxbits - 1
+        while l >= 1 {
+            if count[l] != 0 {
+                count[l] -= 1
+                count[l + 1] += 2
+                break
+            }
+            l -= 1
+        }
+        total -= 1
+    }
+    // the least frequent symbols (first in `sorted`) get the longest codes
+    let mut si: usize = 0
+    let mut l = maxbits.copy()
+    while l >= 1 {
+        let mut c = count[l].copy()
+        while c > 0 {
+            lens[(sorted[si] & 65535) as usize] = l as u8
+            si += 1
+            c -= 1
+        }
+        l -= 1
+    }
+    lens
+}
+
+/// The canonical codes of `lens`, each bit-reversed (deflate sends codes from their top bit
+/// but packs bits from the bottom).
+fn codes_of(lens: List[u8]) -> List[u32] {
+    let mut count: List[u32] = List.filled(0, 16)
+    for l in lens { count[l as usize] += 1 }
+    count[0] = 0
+    let mut next: List[u32] = List.filled(0, 17)
+    let mut code: u32 = 0
+    for l in 1..16 {
+        code = (code + count[(l - 1) as usize]) << 1
+        next[l as usize] = code
+    }
+    let mut codes: List[u32] = List.filled(0, lens.len())
+    for i in 0..lens.len() {
+        let l = lens[i] as usize
+        if l == 0 { continue }
+        codes[i] = reverse(next[l].copy(), l as u32)
+        next[l] += 1
+    }
+    codes
+}
+
+/// A deflate encoder fed in chunks. Make one with `deflater(level)`.
+pub type Deflater = {
+    level: i32, good: usize, lazy_max: usize, nice: usize, chain: usize, greedy: bool,
+    buf: List[u8], pos: usize, block_start: usize,
+    head: List[i32], prev: List[i32],
+    syms: List[u32], lfreq: List[u32], dfreq: List[u32], xbits: u64,
+    ml: usize, ms: usize, mavail: bool,
+    acc: u64, nb: u64,
+    lcode: List[u8], dtab: List[u8], lbase: List[u32], lextra: List[u32], dbase: List[u32], dextra: List[u32],
+    flens: List[u8], fcodes: List[u32], fdcodes: List[u32],
+    state: u32, in_total: u64, out_total: u64,
+}
+
+/// An encoder for `level` 0 (store) to 9 (smallest, slowest); a negative level means the
+/// default, 6 (zlib's), and a level over 9 means 9.
+pub fn deflater(level: i32) -> Deflater {
+    let lv = if level < 0 { 6 } else if level > 9 { 9 } else { level }
+    let mut good: usize = 8
+    let mut lazy_max: usize = 16
+    let mut nice: usize = 128
+    let mut chain: usize = 128
+    let mut greedy = false
+    if lv == 1 {
+        good = 4
+        lazy_max = 4
+        nice = 8
+        chain = 4
+        greedy = true
+    }
+    if lv == 2 {
+        good = 4
+        lazy_max = 5
+        nice = 16
+        chain = 8
+        greedy = true
+    }
+    if lv == 3 {
+        good = 4
+        lazy_max = 6
+        nice = 32
+        chain = 32
+        greedy = true
+    }
+    if lv == 4 {
+        good = 4
+        lazy_max = 4
+        nice = 16
+        chain = 16
+    }
+    if lv == 5 {
+        good = 8
+        lazy_max = 16
+        nice = 32
+        chain = 32
+    }
+    if lv == 7 {
+        good = 8
+        lazy_max = 32
+        nice = 128
+        chain = 256
+    }
+    if lv == 8 {
+        good = 32
+        lazy_max = 128
+        nice = 258
+        chain = 1024
+    }
+    if lv == 9 {
+        good = 32
+        lazy_max = 258
+        nice = 258
+        chain = 4096
+    }
+    let lb = len_base()
+    let le = len_extra()
+    let db = dist_base()
+    let de = dist_extra()
+    // length -> length code (index by length - 3)
+    let mut lcode: List[u8] = List.filled(0, 256)
+    let mut len: usize = 0
+    for code in 0..28 {
+        for k in 0..(1 << le[code as usize]) {
+            lcode[len] = code as u8
+            len += 1
+        }
+    }
+    lcode[255] = 28
+    // distance -> distance code: small distances by value, larger ones by value >> 7
+    let mut dtab: List[u8] = List.filled(0, 512)
+    let mut dist: usize = 0
+    for code in 0..16 {
+        for k in 0..(1 << de[code as usize]) {
+            dtab[dist] = code as u8
+            dist += 1
+        }
+    }
+    dist = dist >> 7
+    for code in 16..30 {
+        for k in 0..(1 << (de[code as usize] - 7)) {
+            dtab[256 + dist] = code as u8
+            dist += 1
+        }
+    }
+    let fl = fixed_lens()
+    let fc = codes_of(fl)
+    let fd = codes_of(List.filled(5, 30))
+    Deflater(lv, good, lazy_max, nice, chain, greedy,
+             List.new(), 0, 0,
+             List.filled(-1, HASH_SIZE), List.filled(-1, WSIZE),
+             List.new(), List.filled(0, 286), List.filled(0, 30), 0,
+             2, 0, false,
+             0, 0,
+             lcode, dtab, lb, le, db, de,
+             fl, fc, fd,
+             0, 0, 0)
+}
+
+fn fixed_lens() -> List[u8] {
+    let mut lens: List[u8] = List.filled(8, 288)
+    let mut i: usize = 144
+    while i < 256 {
+        lens[i] = 9
+        i += 1
+    }
+    while i < 280 {
+        lens[i] = 7
+        i += 1
+    }
+    lens
+}
+
+fn hash3(b: List[u8], i: usize) -> usize {
+    let v = (b[i] as u32) | ((b[i + 1] as u32) << 8) | ((b[i + 2] as u32) << 16)
+    ((v *% 506832829) >> (32 - HASH_BITS)) as usize
+}
+
+impl Deflater {
+    /// Bytes written so far.
+    fn input_size(self) -> u64 { self.in_total }
+
+    /// The compressed bytes produced so far (counting the ones still in the bit buffer).
+    fn output_size(self) -> u64 { self.out_total + (self.nb / 8) }
+
+    fn put(inout self, v: u32, n: u64, inout out: List[u8]) {
+        self.acc = self.acc | ((v as u64) << self.nb)
+        self.nb += n
+        while self.nb >= 8 {
+            out.push((self.acc & 255) as u8)
+            self.acc = self.acc >> 8
+            self.nb -= 8
+            self.out_total += 1
+        }
+    }
+
+    // pads to a byte boundary
+    fn byte_align(inout self, inout out: List[u8]) {
+        if self.nb > 0 {
+            out.push((self.acc & 255) as u8)
+            self.out_total += 1
+            self.acc = 0
+            self.nb = 0
+        }
+    }
+
+    fn emit_lit(inout self, b: u8) {
+        self.syms.push(b as u32)
+        self.lfreq[b as usize] += 1
+    }
+
+    fn emit_match(inout self, len: usize, dist: usize) {
+        self.syms.push(2147483648 | (((len - 3) as u32) << 16) | ((dist - 1) as u32))
+        let lc = self.lcode[len - 3] as usize
+        self.lfreq[257 + lc] += 1
+        let dc = if dist <= 256 { self.dtab[dist - 1] as usize } else { self.dtab[256 + ((dist - 1) >> 7)] as usize }
+        self.dfreq[dc] += 1
+        self.xbits += (self.lextra[lc] + self.dextra[dc]) as u64
+    }
+
+    // inserts position p in the hash chains (3 bytes must be there); the previous head
+    fn insert(inout self, p: usize) -> i32 {
+        let h = hash3(self.buf, p)
+        let old = self.head[h].copy()
+        self.prev[p & WMASK] = old
+        self.head[h] = p as i32
+        old
+    }
+
+    // The longest match for `cur` among the chain from `cand0` that beats `prev_len`:
+    // (length, start), length = prev_len when nothing does.
+    fn longest(self, cur: usize, cand0: i32, prev_len: usize, avail: usize) -> (usize, usize) {
+        let maxlen = if avail < MAX_MATCH { avail } else { MAX_MATCH }
+        let mut best = prev_len.copy()
+        let mut start: usize = 0
+        if best >= maxlen { return (best, 0) }
+        let mut chain = self.chain.copy()
+        if prev_len >= self.good { chain = chain >> 2 }
+        let nice = if self.nice < maxlen { self.nice } else { maxlen }
+        let limit: i32 = if cur > MAX_DIST { (cur - MAX_DIST) as i32 } else { 0 }
+        let mut cand = cand0.copy()
+        let c0 = self.buf[cur].copy()
+        let c1 = self.buf[cur + 1].copy()
+        while true {
+            let cu = cand as usize
+            if self.buf[cu + best] == self.buf[cur + best] && self.buf[cu] == c0 && self.buf[cu + 1] == c1 {
+                let mut l: usize = 2
+                while l < maxlen && self.buf[cu + l] == self.buf[cur + l] { l += 1 }
+                if l > best {
+                    best = l
+                    start = cu
+                    if l >= nice { break }
+                }
+            }
+            chain -= 1
+            if chain == 0 { break }
+            cand = self.prev[cu & WMASK].copy()
+            if cand < limit { break }
+        }
+        (best, start)
+    }
+
+    // Ends the current block: `end` is where its raw bytes stop in the buffer. `last` marks it
+    // final. Chooses stored, fixed or dynamic codes by the smallest.
+    fn end_block(inout self, end: usize, last: bool, inout out: List[u8]) {
+        self.lfreq[256] = 1
+        let span = end - self.block_start
+        let ll = code_lengths(self.lfreq, 286, 15)
+        let dl = code_lengths(self.dfreq, 30, 15)
+        // dynamic header: trimmed lengths, run-length coded
+        let mut hlit: usize = 286
+        while hlit > 257 && ll[hlit - 1] == 0 { hlit -= 1 }
+        let mut hdist: usize = 30
+        while hdist > 1 && dl[hdist - 1] == 0 { hdist -= 1 }
+        let mut all: List[u8] = List.new()
+        for i in 0..hlit { all.push(ll[i]) }
+        for i in 0..hdist { all.push(dl[i]) }
+        let mut ops: List[u32] = List.new()
+        let mut cf: List[u32] = List.filled(0, 19)
+        let mut i: usize = 0
+        while i < all.len() {
+            let v = all[i].copy()
+            let mut run: usize = 1
+            while i + run < all.len() && all[i + run] == v { run += 1 }
+            i += run
+            if v == 0 {
+                while run >= 11 {
+                    let r = if run < 138 { run.copy() } else { 138 }
+                    ops.push(18 | (((r - 11) as u32) << 8))
+                    cf[18] += 1
+                    run -= r
+                }
+                if run >= 3 {
+                    ops.push(17 | (((run - 3) as u32) << 8))
+                    cf[17] += 1
+                    run = 0
+                }
+                while run > 0 {
+                    ops.push(0)
+                    cf[0] += 1
+                    run -= 1
+                }
+            } else {
+                ops.push(v as u32)
+                cf[v as usize] += 1
+                run -= 1
+                while run >= 3 {
+                    let r = if run < 6 { run.copy() } else { 6 }
+                    ops.push(16 | (((r - 3) as u32) << 8))
+                    cf[16] += 1
+                    run -= r
+                }
+                while run > 0 {
+                    ops.push(v as u32)
+                    cf[v as usize] += 1
+                    run -= 1
+                }
+            }
+        }
+        let cl = code_lengths(cf, 19, 7)
+        let order = clen_order()
+        let mut hclen: usize = 19
+        while hclen > 4 && cl[order[hclen - 1] as usize] == 0 { hclen -= 1 }
+        let mut dyn_bits: u64 = 3 + 14 + (hclen as u64) * 3 + self.xbits
+        for t in 0..NC {
+            dyn_bits += (cf[t] as u64) * (cl[t] as u64)
+        }
+        dyn_bits += (cf[16] as u64) * 2 + (cf[17] as u64) * 3 + (cf[18] as u64) * 7
+        let mut fix_bits: u64 = 3 + self.xbits
+        for s in 0..NL {
+            let f = self.lfreq[s] as u64
+            dyn_bits += f * (ll[s] as u64)
+            fix_bits += f * (self.flens[s] as u64)
+        }
+        for s in 0..ND {
+            let f = self.dfreq[s] as u64
+            dyn_bits += f * (dl[s] as u64)
+            fix_bits += f * 5
+        }
+        let stored_ok = span <= 65535
+        let stored_bits: u64 = ((span as u64) + 5) * 8 + 8
+        let bfinal: u32 = if last { 1 } else { 0 }
+        if stored_ok && stored_bits < dyn_bits && stored_bits < fix_bits {
+            self.put(bfinal, 1, inout out)
+            self.put(0, 2, inout out)
+            self.byte_align(inout out)
+            let from = self.block_start.copy()
+            self.put_stored(from, end, inout out)
+        } else if fix_bits <= dyn_bits {
+            self.put(bfinal, 1, inout out)
+            self.put(1, 2, inout out)
+            let fl = self.flens.copy()
+            let fc = self.fcodes.copy()
+            let fd = self.fdcodes.copy()
+            self.put_symbols(fl, fc, List.filled(5, 30), fd, inout out)
+        } else {
+            self.put(bfinal, 1, inout out)
+            self.put(2, 2, inout out)
+            self.put((hlit - 257) as u32, 5, inout out)
+            self.put((hdist - 1) as u32, 5, inout out)
+            self.put((hclen - 4) as u32, 4, inout out)
+            for t in 0..hclen { self.put(cl[order[t] as usize] as u32, 3, inout out) }
+            let cc = codes_of(cl)
+            for op in ops {
+                let s = (op & 255) as usize
+                self.put(cc[s], cl[s] as u64, inout out)
+                if s == 16 { self.put(op >> 8, 2, inout out) }
+                if s == 17 { self.put(op >> 8, 3, inout out) }
+                if s == 18 { self.put(op >> 8, 7, inout out) }
+            }
+            self.put_symbols(ll, codes_of(ll), dl, codes_of(dl), inout out)
+        }
+        self.syms.clear()
+        for s in 0..NL { self.lfreq[s] = 0 }
+        for s in 0..ND { self.dfreq[s] = 0 }
+        self.xbits = 0
+        self.block_start = end
+    }
+
+    // stored block contents: LEN, NLEN, then the bytes buf[from..to]
+    fn put_stored(inout self, from: usize, to: usize, inout out: List[u8]) {
+        let n = to - from
+        out.push((n & 255) as u8)
+        out.push((n >> 8) as u8)
+        out.push(((n ^ 65535) & 255) as u8)
+        out.push(((n ^ 65535) >> 8) as u8)
+        let mut i = from.copy()
+        while i < to {
+            out.push(self.buf[i])
+            i += 1
+        }
+        self.out_total += (n + 4) as u64
+    }
+
+    // the block's symbols with the given codes, then the end-of-block code
+    fn put_symbols(inout self, ll: List[u8], lc: List[u32], dl: List[u8], dc: List[u32], inout out: List[u8]) {
+        let n = self.syms.len()
+        let mut i: usize = 0
+        while i < n {
+            let s = self.syms[i].copy()
+            i += 1
+            if s < 2147483648 {
+                self.put(lc[s as usize], ll[s as usize] as u64, inout out)
+            } else {
+                let len = (((s >> 16) & 255) as usize) + 3
+                let dist = ((s & 65535) as usize) + 1
+                let lcode = self.lcode[len - 3] as usize
+                let sy = 257 + lcode
+                self.put(lc[sy], ll[sy] as u64, inout out)
+                let lx = self.lextra[lcode] as u64
+                if lx > 0 { self.put((len as u32) - self.lbase[lcode], lx, inout out) }
+                let dcode = if dist <= 256 { self.dtab[dist - 1] as usize } else { self.dtab[256 + ((dist - 1) >> 7)] as usize }
+                self.put(dc[dcode], dl[dcode] as u64, inout out)
+                let dx = self.dextra[dcode] as u64
+                if dx > 0 { self.put((dist as u32) - self.dbase[dcode], dx, inout out) }
+            }
+        }
+        self.put(lc[256], ll[256] as u64, inout out)
+    }
+
+    // the raw bytes the current block covers end here
+    fn block_end(self) -> usize { if self.mavail { self.pos - 1 } else { self.pos.copy() } }
+
+    fn block_full(self) -> bool {
+        self.syms.len() >= SYMS_MAX || self.block_end() - self.block_start >= SPAN_MAX
+    }
+
+    // Compresses the buffer from `pos`. Unless `all`, it stops while less than MIN_LOOKAHEAD
+    // bytes remain, so that matches are not cut short by the end of what has been written.
+    fn compress(inout self, all: bool, inout out: List[u8]) {
+        if self.level == 0 {
+            self.store(all, inout out)
+            return
+        }
+        let n = self.buf.len()
+        if self.greedy {
+            while self.pos < n {
+                let avail = n - self.pos
+                if !all && avail < MIN_LOOKAHEAD { break }
+                let pos = self.pos.copy()
+                let mut ml: usize = 0
+                let mut ms: usize = 0
+                if avail >= MIN_MATCH {
+                    let cand = self.insert(pos)
+                    if cand >= 0 && pos - (cand as usize) <= MAX_DIST {
+                        let (l, s) = self.longest(pos, cand, 2, avail)
+                        if l >= MIN_MATCH {
+                            ml = l
+                            ms = s
+                        }
+                    }
+                }
+                if ml >= MIN_MATCH {
+                    self.emit_match(ml, pos - ms)
+                    if ml <= self.lazy_max {
+                        let mut q = pos + 1
+                        let stop = pos + ml
+                        while q < stop {
+                            if q + MIN_MATCH <= n {
+                                let _ = self.insert(q)
+                            }
+                            q += 1
+                        }
+                    }
+                    self.pos = pos + ml
+                } else {
+                    let b = self.buf[pos].copy()
+                    self.emit_lit(b)
+                    self.pos = pos + 1
+                }
+                if self.block_full() { self.end_block(self.pos.copy(), false, inout out) }
+            }
+        } else {
+            while self.pos < n {
+                let avail = n - self.pos
+                if !all && avail < MIN_LOOKAHEAD { break }
+                let pos = self.pos.copy()
+                let mut cand: i32 = -1
+                if avail >= MIN_MATCH { cand = self.insert(pos) }
+                let prev_len = self.ml.copy()
+                let prev_match = self.ms.copy()
+                self.ml = 2
+                if cand >= 0 && prev_len < self.lazy_max && pos - (cand as usize) <= MAX_DIST {
+                    let (l, s) = self.longest(pos, cand, prev_len, avail)
+                    self.ml = l
+                    if l > prev_len { self.ms = s }
+                    if self.ml == 3 && pos - self.ms > 4096 { self.ml = 2 }
+                }
+                if prev_len >= MIN_MATCH && self.ml <= prev_len {
+                    self.emit_match(prev_len, pos - 1 - prev_match)
+                    let mut q = pos + 1
+                    let stop = pos + prev_len - 1
+                    while q < stop {
+                        if q + MIN_MATCH <= n {
+                            let _ = self.insert(q)
+                        }
+                        q += 1
+                    }
+                    self.mavail = false
+                    self.ml = 2
+                    self.pos = pos + prev_len - 1
+                } else if self.mavail {
+                    let b = self.buf[pos - 1].copy()
+                    self.emit_lit(b)
+                    self.pos = pos + 1
+                } else {
+                    self.mavail = true
+                    self.pos = pos + 1
+                }
+                if self.block_full() { self.end_block(self.block_end(), false, inout out) }
+            }
+        }
+        if all && self.mavail {
+            let b = self.buf[self.pos - 1].copy()
+            self.emit_lit(b)
+            self.mavail = false
+            self.ml = 2
+        }
+    }
+
+    // level 0: stored blocks of up to 65535 bytes
+    fn store(inout self, all: bool, inout out: List[u8]) {
+        let n = self.buf.len()
+        while n - self.block_start >= 65535 || (all && n > self.block_start) {
+            let take = if n - self.block_start < 65535 { n - self.block_start } else { 65535 }
+            self.put(0, 3, inout out)
+            self.byte_align(inout out)
+            let from = self.block_start.copy()
+            self.put_stored(from, from + take, inout out)
+            self.block_start += take
+        }
+        self.pos = n
+    }
+
+    // Moves the window down when the buffer is long, keeping the hash chains right.
+    fn slide(inout self) {
+        let keep = if self.block_start < self.pos { self.block_start.copy() } else { self.pos.copy() }
+        let lim = if self.pos > WSIZE { self.pos - WSIZE } else { 0 }
+        let mut upto = if keep < lim { keep } else { lim }
+        // a match found for the position before `pos` still refers to its start
+        if self.ml >= MIN_MATCH && self.ms < upto { upto = self.ms.copy() }
+        let shift = (upto / WSIZE) * WSIZE
+        if shift == 0 { return }
+        self.buf.remove_range(0, shift)
+        self.pos -= shift
+        self.block_start -= shift
+        if self.ml >= MIN_MATCH { self.ms -= shift }
+        let sh = shift as i32
+        for i in 0..HASH_SIZE {
+            let v = self.head[i].copy()
+            self.head[i] = if v >= sh { v - sh } else { -1 }
+        }
+        for i in 0..WSIZE {
+            let v = self.prev[i].copy()
+            self.prev[i] = if v >= sh { v - sh } else { -1 }
+        }
+    }
+
+    /// Compresses `data`, appending the compressed bytes that are ready to `out` (a few may
+    /// stay buffered until later calls, `flush` or `finish`).
+    fn write(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state != 0 { return Err(compression.error(compression.Closed, "deflate: encoder is finished", self.in_total)) }
+        self.in_total += data.len() as u64
+        let mut i: usize = 0
+        let len = data.len()
+        while i < len {
+            let room = if self.buf.len() < WORK { WORK - self.buf.len() } else { 0 }
+            if room == 0 {
+                self.slide()
+                continue
+            }
+            let take = if len - i < room { len - i } else { room }
+            let stop = i + take
+            while i < stop {
+                self.buf.push(data[i])
+                i += 1
+            }
+            self.compress(false, inout out)
+            self.slide()
+        }
+        Ok(())
+    }
+
+    /// A sync flush: everything written so far is compressed, and the output ends on a byte
+    /// boundary with an empty stored block, so a decoder fed all of `out` so far can produce
+    /// all of the input so far.
+    fn flush(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state != 0 { return Err(compression.error(compression.Closed, "deflate: encoder is finished", self.in_total)) }
+        self.compress(true, inout out)
+        if self.level != 0 {
+            if self.syms.len() > 0 { self.end_block(self.pos.copy(), false, inout out) }
+            self.block_start = self.pos.copy()
+        }
+        self.put(0, 3, inout out)
+        self.byte_align(inout out)
+        out.push(0)
+        out.push(0)
+        out.push(255)
+        out.push(255)
+        self.out_total += 4
+        self.slide()
+        Ok(())
+    }
+
+    /// Ends the stream: the last block, final bit set.
+    fn finish(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state != 0 { return Err(compression.error(compression.Closed, "deflate: encoder is finished", self.in_total)) }
+        self.compress(true, inout out)
+        if self.level == 0 {
+            // the last stored block (maybe empty) with the final bit
+            self.put(1, 3, inout out)
+            self.byte_align(inout out)
+            let from = self.block_start.copy()
+            self.put_stored(from, from, inout out)
+        } else {
+            self.end_block(self.pos.copy(), true, inout out)
+        }
+        self.byte_align(inout out)
+        self.state = 1
+        Ok(())
+    }
+
+    fn finished(self) -> bool { self.state != 0 }
+}
+
+/// Compresses `data` to a raw deflate stream.
+pub fn deflate(data: List[u8], level: i32) -> List[u8] {
+    let mut d = deflater(level)
+    let mut out: List[u8] = List.new()
+    match d.write(data, inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match d.finish(inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    out
+}

@@ -1,0 +1,4 @@
+target/
+# a library does not commit its lock: scripts/build.sh writes it (eider-pkg fetch)
+eider.lock
+examples/*/eider.lock
