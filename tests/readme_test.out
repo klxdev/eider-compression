@@ -1,0 +1,17 @@
+gzip: 29 bytes back from 28
+zstd: 29 bytes back
+pieces: 38 bytes
+Content-Encoding: GZIP -> 38 bytes
+Content-Encoding: br -> Unsupported
+Accept-Encoding: gzip, deflate, zstd -> zstd
+Accept-Encoding: deflate, gzip;q=0.5 -> gzip
+Accept-Encoding: gzip;q=0.2, zstd;q=0.8 -> zstd
+Accept-Encoding: *;q=0, gzip -> gzip
+Accept-Encoding: gzip;q=0 -> none
+Accept-Encoding: * -> zstd
+Accept-Encoding:  -> none
+Accept-Encoding: br, identity -> none
+Accept-Encoding: GZip ; Q=0.7 , zstd;q=0.7 -> zstd
+read back: line one
+line two
+

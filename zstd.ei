@@ -173,6 +173,7 @@ fn fse_read(b: List[u8], from: usize, to: usize, max_log: u32, max_sym: usize) -
         count -= 1
         let mag = if count < 0 { -count } else { count }
         remaining -= mag
+        if remaining < 1 { return Err(String.from("FSE counts do not add up")) }
         norm.push(count)
         prev0 = count == 0
         if norm.len() > max_sym + 1 { return Err(String.from("FSE table has too many symbols")) }
@@ -466,11 +467,7 @@ impl Decoder {
 
     fn flush_into(inout self, inout out: List[u8]) {
         let n = self.hist.len()
-        let mut i = self.flushed.copy()
-        while i < n {
-            out.push(self.hist[i])
-            i += 1
-        }
+        if n > self.flushed { out.extend(self.hist.slice(self.flushed, n)) }
         self.out_total += (n - self.flushed) as u64
         self.flushed = n
         let keep = self.window as usize
@@ -961,10 +958,15 @@ impl Decoder {
             if lp + llen > nl { return Err(fail(inout self, compression.Corrupt, "zstd: sequence uses more literals than the block has")) }
             if (llen as u64) + (mlen as u64) > room { return Err(self.over(true)) }
             room -= (llen as u64) + (mlen as u64)
-            let mut k: usize = 0
-            while k < llen {
-                self.hist.push(lits[lp + k])
-                k += 1
+            if llen >= 24 {
+                let piece = lits.slice(lp, lp + llen)
+                self.hist.extend(piece)
+            } else {
+                let mut k: usize = 0
+                while k < llen {
+                    self.hist.push(lits[lp + k])
+                    k += 1
+                }
             }
             lp += llen
             // the match
@@ -976,10 +978,15 @@ impl Decoder {
                 return Err(fail(inout self, compression.Corrupt, "zstd: match offset over the window size"))
             }
             let src = have - offset
-            k = 0
-            while k < mlen {
-                self.hist.push(self.hist[src + k])
-                k += 1
+            if mlen >= 24 && offset >= mlen {
+                let piece = self.hist.slice(src, src + mlen)
+                self.hist.extend(piece)
+            } else {
+                let mut k: usize = 0
+                while k < mlen {
+                    self.hist.push(self.hist[src + k])
+                    k += 1
+                }
             }
             made += llen + mlen
             if made > BLOCK_MAX { return Err(fail(inout self, compression.Corrupt, "zstd: block regenerates more than the maximum block size")) }

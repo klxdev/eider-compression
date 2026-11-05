@@ -315,11 +315,7 @@ impl Inflater {
     /// Moves decoded bytes not yet delivered to `out` and trims the window.
     fn flush_into(inout self, inout out: List[u8]) {
         let n = self.hist.len()
-        let mut i = self.flushed.copy()
-        while i < n {
-            out.push(self.hist[i])
-            i += 1
-        }
+        if n > self.flushed { out.extend(self.hist.slice(self.flushed, n)) }
         self.out_total += (n - self.flushed) as u64
         self.flushed = n
         if n > 131072 {

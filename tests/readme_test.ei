@@ -1,0 +1,95 @@
+// The examples of README.md and docs/http.md, run: they must keep compiling and doing what the text says.
+
+import core.sys
+import std.stream
+import compression
+import compression.codec as codec
+import compression.gzip as gzip
+import compression.streams as streams
+import compression.zstd as zstd
+
+// ---- README, "Whole buffers"
+fn whole_buffers() uses io {
+    let text = sys.lit("hello hello hello hello hello")
+    let packed = gzip.compress(text, 6)
+    match gzip.decompress(packed) {
+        Ok(back) => print("gzip: {back.len()} bytes back from {packed.len()}")
+        Err(e) => print("gzip failed: {e}")
+    }
+    let z = zstd.compress(text, 3)
+    match zstd.decompress(z) {
+        Ok(back) => print("zstd: {back.len()} bytes back")
+        Err(e) => print("zstd failed: {e}")
+    }
+}
+
+// ---- README, "Streams": decode a body that arrives in pieces, appending to one List
+fn decode_pieces(pieces: List[List[u8]]) -> Result[List[u8], compression.Error] {
+    let mut dec = gzip.decoder(compression.limit_output(1000000))
+    let mut out: List[u8] = List.new()
+    for piece in pieces {
+        dec.feed(piece, inout out)?
+    }
+    dec.finish()?
+    Ok(out)
+}
+
+// ---- docs/http.md, "Request bodies": the Content-Encoding of a request
+fn decode_body(content_encoding: List[u8], body: List[u8]) -> Result[List[u8], compression.Error] {
+    match codec.format_of(content_encoding) {
+        Some(f) => codec.decode(f, body, compression.limit_output(8388608))
+        None => Err(compression.error(compression.Unsupported, "unsupported Content-Encoding", 0))
+    }
+}
+
+// ---- docs/http.md, "Responses": choose a coding from Accept-Encoding, compress the body
+fn pick(accept: str) -> Option[codec.Format] {
+    // the codings this server offers, in its order of preference
+    codec.negotiate(accept.bytes(), List[codec.Zstd, codec.Gzip])
+}
+
+fn main() uses io {
+    whole_buffers()
+    let packed = gzip.compress(sys.lit("streamed in pieces, streamed in pieces"), 6)
+    match decode_pieces(List[packed.slice(0, 7), packed.slice(7, 15), packed.slice(15, packed.len())]) {
+        Ok(o) => print("pieces: {o.len()} bytes")
+        Err(e) => print("pieces failed: {e}")
+    }
+    match decode_body(sys.lit("GZIP"), packed) {
+        Ok(o) => print("Content-Encoding: GZIP -> {o.len()} bytes")
+        Err(e) => print("failed: {e}")
+    }
+    match decode_body(sys.lit("br"), packed) {
+        Ok(o) => print("br -> {o.len()} bytes")
+        Err(e) => print("Content-Encoding: br -> {e.kind}")
+    }
+    match pick("gzip, deflate, zstd") {
+        Some(f) => print("Accept-Encoding: gzip, deflate, zstd -> {codec.name(f)}")
+        None => print("none")
+    }
+    for h in List["deflate, gzip;q=0.5", "gzip;q=0.2, zstd;q=0.8", "*;q=0, gzip", "gzip;q=0", "*", "", "br, identity", "GZip ; Q=0.7 , zstd;q=0.7"] {
+        match pick(h) {
+            Some(f) => print("Accept-Encoding: {h} -> {codec.name(f)}")
+            None => print("Accept-Encoding: {h} -> none")
+        }
+    }
+    // README, "std/stream"
+    let mut w = streams.encode_writer(stream.buffer(), codec.Gzip, 6)
+    match w.write(sys.lit("line one\n")) {
+        Ok(_) => {}
+        Err(e) => print("write: {e}")
+    }
+    match w.write(sys.lit("line two\n")) {
+        Ok(_) => {}
+        Err(e) => print("write: {e}")
+    }
+    match w.close() {
+        Ok(_) => {}
+        Err(e) => print("close: {e}")
+    }
+    let mut r = streams.decode_reader(stream.reader(w.inner().bytes()), codec.Gzip, compression.limits())
+    match r.read_text() {
+        Ok(t) => print("read back: {t}")
+        Err(e) => print("read: {e}")
+    }
+}

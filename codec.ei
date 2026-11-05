@@ -372,3 +372,115 @@ pub fn encode(fmt: Format, data: List[u8], level: i32) -> List[u8] {
     }
     out
 }
+
+// ---- Accept-Encoding
+
+fn lower(b: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in b { out.push(if c >= 65 && c <= 90 { c + 32 } else { c }) }
+    out
+}
+
+fn trim(b: List[u8]) -> List[u8] {
+    let mut s: usize = 0
+    let mut e = b.len()
+    while s < e && (b[s] == 32 || b[s] == 9) { s += 1 }
+    while e > s && (b[e - 1] == 32 || b[e - 1] == 9) { e -= 1 }
+    b.slice(s, e)
+}
+
+// "0", "1", "0.5", "0.123" (up to three decimals) as thousandths; -1 if malformed
+fn qvalue(b: List[u8]) -> i32 {
+    if b.len() == 0 { return -1 }
+    if b[0] != 48 && b[0] != 49 { return -1 }
+    let mut v: i32 = ((b[0] - 48) as i32) * 1000
+    if b.len() == 1 { return v }
+    if b[1] != 46 || b.len() > 5 { return -1 }
+    let mut scale: i32 = 100
+    let mut i: usize = 2
+    while i < b.len() {
+        if b[i] < 48 || b[i] > 57 { return -1 }
+        v += ((b[i] - 48) as i32) * scale
+        scale = scale / 10
+        i += 1
+    }
+    if v > 1000 { return -1 }
+    v
+}
+
+fn coding_names(f: Format) -> List[str] {
+    match f {
+        Gzip => List["gzip", "x-gzip"]
+        Zlib => List["deflate"]
+        Raw => List["deflate"]
+        Deflate => List["deflate"]
+        Zstd => List["zstd"]
+        Identity => List["identity"]
+        Auto => List["identity"]
+    }
+}
+
+/// The coding to answer with: the best of `offered` (the server's order of preference, first
+/// wins a tie) that the Accept-Encoding header value `accept` allows, by the q-values (`q=0`
+/// forbids, `*` stands for the codings not named, a missing q is 1, malformed items are
+/// ignored). None when nothing offered is allowed or the header is empty: send the body as it
+/// is (identity), without a Content-Encoding.
+pub fn negotiate(accept: List[u8], offered: List[Format]) -> Option[Format] {
+    let mut names: List[List[u8]] = List.new()
+    let mut qs: List[i32] = List.new()
+    let mut star: i32 = -1
+    let mut start: usize = 0
+    let n = accept.len()
+    let mut i: usize = 0
+    while i <= n {
+        if i == n || accept[i] == 44 {
+            let item = trim(accept.slice(start, i))
+            start = i + 1
+            if item.len() > 0 {
+                // coding[;q=value]
+                let mut semi: usize = item.len()
+                let mut k: usize = 0
+                while k < item.len() {
+                    if item[k] == 59 {
+                        semi = k.copy()
+                        break
+                    }
+                    k += 1
+                }
+                let name = lower(trim(item.slice(0, semi)))
+                let mut q: i32 = 1000
+                if semi < item.len() {
+                    let param = lower(trim(item.slice(semi + 1, item.len())))
+                    if param.len() >= 2 && param[0] == 113 && param[1] == 61 {
+                        q = qvalue(trim(param.slice(2, param.len())))
+                    }
+                }
+                if q >= 0 && name.len() > 0 {
+                    if name.len() == 1 && name[0] == 42 {
+                        star = q
+                    } else {
+                        names.push(name)
+                        qs.push(q)
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    let mut best: Option[Format] = None
+    let mut best_q: i32 = 0
+    for f in offered {
+        let mut q: i32 = -1
+        for alias in coding_names(f) {
+            for j in 0..names.len() {
+                if eq(names[j], alias) && qs[j] > q { q = qs[j] }
+            }
+        }
+        if q < 0 { q = star }
+        if q > best_q {
+            best_q = q
+            best = Some(f.copy())
+        }
+    }
+    best
+}
