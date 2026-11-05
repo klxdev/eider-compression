@@ -1,0 +1,71 @@
+// What the encoders write, the decoders read back: every level and format, inputs of every size
+// around the boundaries (a match's length, the window, a block), text, noise, runs, a mixture.
+// Also that compression helps where it should (text is smaller, zeros much smaller, noise grows
+// by no more than a few bytes per block).
+
+import compression
+import compression.deflate
+import compression.zlib
+import compression.gzip
+import compression.zstd
+import compression.tests.util as util
+
+fn kinds() -> List[str] { List["text", "noise", "mixed", "zeros"] }
+
+fn make(kind: str, n: usize, seed: u64) -> List[u8] {
+    if kind == "text" { return util.text(n, seed) }
+    if kind == "noise" { return util.noise(n, seed) }
+    if kind == "mixed" { return util.mixed(n, seed) }
+    util.zeros(n)
+}
+
+fn sizes() -> List[usize] {
+    List[0, 1, 2, 3, 4, 5, 100, 257, 258, 259, 1000, 4096, 32767, 32768, 32769, 65535, 65536, 65537, 100000, 140000]
+}
+
+fn main() uses io {
+    // deflate, zlib, gzip: all levels on the smaller inputs, a few on the larger
+    let mut runs = 0
+    let mut bad = 0
+    for kind in kinds() {
+        for n in sizes() {
+            let data = make(kind, n, (n as u64) + 1)
+            let levels: List[i32] = if n <= 65537 { List[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] } else { List[0, 1, 6, 9] }
+            for lv in levels {
+                runs += 3
+                util.expect("deflate {kind} {n} level {lv}", deflate.inflate(deflate.deflate(data, lv)), data, inout bad)
+                util.expect("zlib {kind} {n} level {lv}", zlib.decompress(zlib.compress(data, lv)), data, inout bad)
+                util.expect("gzip {kind} {n} level {lv}", gzip.decompress(gzip.compress(data, lv)), data, inout bad)
+            }
+        }
+    }
+    print("deflate, zlib, gzip: {runs} round trips, {bad} failures")
+
+    // zstd
+    runs = 0
+    bad = 0
+    for kind in kinds() {
+        for n in sizes() {
+            let data = make(kind, n, (n as u64) + 1)
+            for lv in List[0, 1, 3] {
+                runs += 1
+                util.expect("zstd {kind} {n} level {lv}", zstd.decompress(zstd.compress(data, lv)), data, inout bad)
+            }
+        }
+    }
+    print("zstd: {runs} round trips, {bad} failures")
+
+    // sizes
+    let text = util.text(100000, 5)
+    let zeros = util.zeros(100000)
+    let noise = util.noise(100000, 5)
+    print("deflate text: {deflate.deflate(text, 6).len() < 40000}")
+    print("deflate level 9 not larger than level 1: {deflate.deflate(text, 9).len() <= deflate.deflate(text, 1).len()}")
+    print("deflate zeros: {deflate.deflate(zeros, 6).len() < 200}")
+    print("deflate noise grows by less than 0.1%: {deflate.deflate(noise, 6).len() < 100100}")
+    print("deflate level 0 is stored: {deflate.deflate(text, 0).len() < 100000 + 30}")
+    print("gzip text: {gzip.compress(text, 6).len() < 40000}")
+    print("zstd zeros: {zstd.compress(zeros, 3).len() < 200}")
+    print("zstd text: {zstd.compress(text, 3).len() < 45000}")
+    print("zstd noise grows by less than 0.1%: {zstd.compress(noise, 3).len() < 100100}")
+}

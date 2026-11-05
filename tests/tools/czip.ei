@@ -14,6 +14,8 @@ import compression.deflate
 import compression.gzip
 import compression.zlib
 import compression.zstd
+import compression.codec
+import compression.streams
 
 fn text(b: List[u8]) -> String {
     match String.from_bytes(b) {
@@ -65,6 +67,8 @@ fn main() uses io, fs, clock {
             Ok(o) => { out = o }
             Err(e) => { err = e.to_string() }
         }
+    } else if cmd == String.from("zstd") {
+        out = zstd.compress(data, strings.parse_i32(lvl).unwrap())
     } else if cmd == String.from("deflate") {
         out = deflate.deflate(data, strings.parse_i32(lvl).unwrap())
     } else {

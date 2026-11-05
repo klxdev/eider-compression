@@ -1012,3 +1012,462 @@ pub fn decompress_with(data: List[u8], lim: compression.Limits) -> Result[List[u
     d.finish()?
     Ok(out)
 }
+
+// ---- the encoder
+
+// FSE encoding tables (the inverse of `Fse`), built from the same normalized counts.
+type FseEnc = { dnb: List[u32], dfs: List[i32], st: List[u32], log: u32 }
+
+fn fse_enc(norm: List[i32], n: usize, log: u32) -> FseEnc {
+    let size: usize = 1 << (log as usize)
+    let mask = size - 1
+    let step = (size >> 1) + (size >> 3) + 3
+    let mut sym: List[u8] = List.filled(0, size)
+    let mut high: i32 = (size as i32) - 1
+    let mut cumul: List[u32] = List.filled(0, n + 1)
+    for s in 0..n {
+        if norm[s] == -1 {
+            cumul[s + 1] = cumul[s] + 1
+            sym[high as usize] = s as u8
+            high -= 1
+        } else {
+            cumul[s + 1] = cumul[s] + (norm[s] as u32)
+        }
+    }
+    let mut pos: usize = 0
+    for s in 0..n {
+        let c = norm[s].copy()
+        if c > 0 {
+            let mut i: i32 = 0
+            while i < c {
+                sym[pos] = s as u8
+                pos = (pos + step) & mask
+                while (pos as i32) > high { pos = (pos + step) & mask }
+                i += 1
+            }
+        }
+    }
+    let mut st: List[u32] = List.filled(0, size)
+    let mut fill: List[u32] = cumul.copy()
+    for u in 0..size {
+        let s = sym[u] as usize
+        st[fill[s] as usize] = (size + u) as u32
+        fill[s] += 1
+    }
+    let mut dnb: List[u32] = List.filled(0, n)
+    let mut dfs: List[i32] = List.filled(0, n)
+    let mut total: i32 = 0
+    for s in 0..n {
+        let c = norm[s].copy()
+        if c == 0 {
+            dnb[s] = (((log + 1) << 16) - (1 << log)) as u32
+        } else if c == -1 || c == 1 {
+            dnb[s] = ((log << 16) - (1 << log)) as u32
+            dfs[s] = total - 1
+            total += 1
+        } else {
+            let maxbits = log - highbit((c - 1) as u32)
+            let minplus = (c as u32) << maxbits
+            dnb[s] = (maxbits << 16) - minplus
+            dfs[s] = total - c
+            total += c
+        }
+    }
+    FseEnc(dnb, dfs, st, log)
+}
+
+// A bit stream written forward, LSB first, closed with a marker bit (read backwards by the decoder).
+type Bw = { out: List[u8], acc: u64, n: u64 }
+
+impl Bw {
+    fn add(inout self, v: u64, k: u64) {
+        if k == 0 { return }
+        self.acc = self.acc | ((v & ((1 << k) - 1)) << self.n)
+        self.n += k
+        while self.n >= 8 {
+            self.out.push((self.acc & 255) as u8)
+            self.acc = self.acc >> 8
+            self.n -= 8
+        }
+    }
+
+    fn close(inout self) {
+        self.add(1, 1)
+        if self.n > 0 {
+            self.out.push((self.acc & 255) as u8)
+            self.acc = 0
+            self.n = 0
+        }
+    }
+}
+
+// the state after the first symbol (nothing is written for it)
+fn fse_init(t: FseEnc, s: usize) -> u32 {
+    let nbo = (t.dnb[s] + 32768) >> 16
+    let v = (nbo << 16) - t.dnb[s]
+    t.st[(((v >> nbo) as i32) + t.dfs[s]) as usize]
+}
+
+fn fse_put(t: FseEnc, inout state: u32, s: usize, inout bw: Bw) {
+    let nbo = (state + t.dnb[s]) >> 16
+    bw.add(state as u64, nbo as u64)
+    state = t.st[(((state >> nbo) as i32) + t.dfs[s]) as usize]
+}
+
+fn ll_code_of(v: usize) -> usize {
+    if v < 16 { return v }
+    let b = ll_base()
+    let mut c: usize = 16
+    while c + 1 < 36 && (b[c + 1] as usize) <= v { c += 1 }
+    c
+}
+
+fn ml_code_of(m: usize) -> usize {
+    if m < 35 { return m - 3 }
+    let b = ml_base()
+    let mut c: usize = 32
+    while c + 1 < 53 && (b[c + 1] as usize) <= m { c += 1 }
+    c
+}
+
+const ZWIN: usize = 131072
+const ZHASH: usize = 32768
+const ZMIN: usize = 4
+
+fn hash4(b: List[u8], i: usize) -> usize {
+    let v = (b[i] as u32) | ((b[i + 1] as u32) << 8) | ((b[i + 2] as u32) << 16) | ((b[i + 3] as u32) << 24)
+    ((v *% 2654435761) >> 17) as usize
+}
+
+/// A streaming zstd encoder. Make one with `encoder(level)`.
+///
+/// The output is a single frame with a 128 KiB window and an XXH64 content checksum, in blocks
+/// of at most 128 KiB. A block is raw, RLE (one repeated byte) or compressed: the literals are
+/// stored raw, and the sequences (literal run, match length, offset) are coded with the
+/// predefined FSE tables (no Huffman-coded literals, no custom tables, no repeat offsets). So the
+/// output is valid zstd any decoder reads, and smaller than the input where matches exist, but
+/// larger than libzstd's at the same level.
+pub type Encoder = {
+    level: i32, depth: usize, lazy: bool,
+    buf: List[u8], bstart: usize, started: bool, csum: ck.Xxh64, in_total: u64, state: u32,
+    head: List[i32], prev: List[i32],
+    llt: FseEnc, oft: FseEnc, mlt: FseEnc,
+}
+
+/// `level` 0 stores (raw and RLE blocks only); 1 and 2 are greedy matchers with hash chains of
+/// 4 and 16, 3 or more also tries the next position (lazy matching) with a chain of 48. A
+/// negative level is 3.
+pub fn encoder(level: i32) -> Encoder {
+    let lv = if level < 0 { 3 } else if level > 3 { 3 } else { level }
+    let mut depth: usize = 4
+    if lv == 2 { depth = 16 }
+    if lv == 3 { depth = 48 }
+    Encoder(lv, depth, lv >= 3, List.new(), 0, false, ck.xxh64_new(), 0, 0,
+            List.filled(-1, ZHASH), List.filled(-1, ZWIN),
+            fse_enc(ll_default(), 36, 6), fse_enc(of_default(), 29, 5), fse_enc(ml_default(), 53, 6))
+}
+
+fn put_le(inout out: List[u8], v: u64, n: usize) {
+    let mut k: usize = 0
+    while k < n {
+        out.push(((v >> ((k * 8) as u64)) & 255) as u8)
+        k += 1
+    }
+}
+
+impl Encoder {
+    fn header(inout self, inout out: List[u8]) {
+        if self.started { return }
+        self.started = true
+        put_le(inout out, 4247762216, 4)
+        // content checksum flag; no single segment, no content size, no dictionary
+        out.push(4)
+        // window 128 KiB (log 17: exponent 7, mantissa 0)
+        out.push(56)
+    }
+
+    // inserts position p (4 bytes must follow); the previous head
+    fn insert(inout self, p: usize) -> i32 {
+        let h = hash4(self.buf, p)
+        let old = self.head[h].copy()
+        self.prev[p & (ZWIN - 1)] = old
+        self.head[h] = p as i32
+        old
+    }
+
+    // The longest match for position p among the chain from `cand0`, not reaching past `end`:
+    // (length, start); length 0 if shorter than ZMIN.
+    fn find(self, p: usize, cand0: i32, end: usize) -> (usize, usize) {
+        let maxlen = end - p
+        let mut best: usize = 0
+        let mut start: usize = 0
+        let mut cand = cand0.copy()
+        let mut chain = self.depth.copy()
+        let limit: i32 = if p > ZWIN - 1 { (p - (ZWIN - 1)) as i32 } else { 0 }
+        while cand >= limit && chain > 0 {
+            let c = cand as usize
+            if self.buf[c + best] == self.buf[p + best] || best == 0 {
+                let mut l: usize = 0
+                while l < maxlen && self.buf[c + l] == self.buf[p + l] { l += 1 }
+                if l > best {
+                    best = l
+                    start = c
+                    if l >= 256 || l == maxlen { break }
+                }
+            }
+            chain -= 1
+            if chain == 0 { break }
+            cand = self.prev[c & (ZWIN - 1)].copy()
+        }
+        if best < ZMIN { return (0, 0) }
+        (best, start)
+    }
+
+    // Raw or RLE block for buf[from .. to].
+    fn raw_block(inout self, from: usize, to: usize, last: bool, inout out: List[u8]) {
+        let n = to - from
+        let lastbit: u64 = if last { 1 } else { 0 }
+        let mut same = n >= 4
+        let mut i = from + 1
+        while same && i < to {
+            if self.buf[i] != self.buf[from] { same = false }
+            i += 1
+        }
+        if same {
+            put_le(inout out, lastbit | (1 << 1) | ((n as u64) << 3), 3)
+            out.push(self.buf[from])
+        } else {
+            put_le(inout out, lastbit | ((n as u64) << 3), 3)
+            let mut k = from.copy()
+            while k < to {
+                out.push(self.buf[k])
+                k += 1
+            }
+        }
+    }
+
+    // One block for buf[from .. to] (at most 128 KiB).
+    fn block(inout self, from: usize, to: usize, last: bool, inout out: List[u8]) {
+        let n = to - from
+        if self.level == 0 || n < 16 {
+            self.raw_block(from, to, last, inout out)
+            // keep the match finder's view of the data right
+            return
+        }
+        // ---- find sequences
+        let mut sll: List[u32] = List.new()
+        let mut sml: List[u32] = List.new()
+        let mut sof: List[u32] = List.new()
+        let mut lits: List[u8] = List.new()
+        let mut anchor = from.copy()
+        let mut p = from.copy()
+        let limit = to - 8
+        while p + ZMIN <= to && p < limit {
+            let cand = self.insert(p)
+            let mut ml: usize = 0
+            let mut ms: usize = 0
+            if cand >= 0 {
+                let (l, s) = self.find(p, cand, to)
+                ml = l
+                ms = s
+            }
+            let mut next_in = false
+            if ml > 0 && self.lazy && p + 1 + ZMIN <= to && ml < 32 {
+                // is the next position better by more than a literal's worth?
+                let c2 = self.insert(p + 1)
+                next_in = true
+                if c2 >= 0 {
+                    let (l2, s2) = self.find(p + 1, c2, to)
+                    if l2 > ml + 1 {
+                        // take a literal, then that match
+                        p += 1
+                        ml = l2
+                        ms = s2
+                        next_in = false
+                    }
+                }
+            }
+            if ml == 0 {
+                p += 1
+                continue
+            }
+            let mut k = anchor.copy()
+            while k < p {
+                lits.push(self.buf[k])
+                k += 1
+            }
+            sll.push((p - anchor) as u32)
+            sml.push(ml as u32)
+            sof.push((p - ms) as u32)
+            // the positions inside the match join the chains (a few only at level 1)
+            let stop = p + ml
+            let mut q = p + 1
+            if next_in { q += 1 }
+            let mut cnt: usize = 0
+            while q < stop && q + ZMIN <= to && (self.level >= 2 || cnt < 2) {
+                let _unused = self.insert(q)
+                q += 1
+                cnt += 1
+            }
+            p = stop
+            anchor = stop
+        }
+        let mut k = anchor.copy()
+        while k < to {
+            lits.push(self.buf[k])
+            k += 1
+        }
+        // ---- the compressed block
+        let mut body: List[u8] = List.new()
+        // literals, raw
+        let ln = lits.len()
+        if ln < 32 {
+            body.push((ln << 3) as u8)
+        } else if ln < 4096 {
+            put_le(inout body, ((ln as u64) << 4) | 4, 2)
+        } else {
+            put_le(inout body, ((ln as u64) << 4) | 12, 3)
+        }
+        body.extend(lits)
+        // sequences
+        let ns = sll.len()
+        if ns < 128 {
+            body.push(ns as u8)
+        } else if ns < 32512 {
+            body.push(((ns >> 8) + 128) as u8)
+            body.push((ns & 255) as u8)
+        } else {
+            body.push(255)
+            put_le(inout body, (ns - 32512) as u64, 2)
+        }
+        if ns > 0 {
+            body.push(0)
+            let llt = self.llt.copy()
+            let oft = self.oft.copy()
+            let mlt = self.mlt.copy()
+            let lb = ll_bits()
+            let mb = ml_bits()
+            let mut bw = Bw(List.new(), 0, 0)
+            let last_i = ns - 1
+            let lc = ll_code_of(sll[last_i] as usize)
+            let mc = ml_code_of(sml[last_i] as usize)
+            let ob = (sof[last_i] as u64) + 3
+            let oc = highbit(ob as u32) as usize
+            let mut sm = fse_init(mlt, mc)
+            let mut so = fse_init(oft, oc)
+            let mut sl = fse_init(llt, lc)
+            bw.add(sll[last_i] as u64 - (ll_base()[lc] as u64), lb[lc] as u64)
+            bw.add(sml[last_i] as u64 - (ml_base()[mc] as u64), mb[mc] as u64)
+            bw.add(ob - (1 << (oc as u64)), oc as u64)
+            let mut i = last_i.copy()
+            while i > 0 {
+                i -= 1
+                let lc = ll_code_of(sll[i] as usize)
+                let mc = ml_code_of(sml[i] as usize)
+                let ob = (sof[i] as u64) + 3
+                let oc = highbit(ob as u32) as usize
+                fse_put(oft, inout so, oc, inout bw)
+                fse_put(mlt, inout sm, mc, inout bw)
+                fse_put(llt, inout sl, lc, inout bw)
+                bw.add(sll[i] as u64 - (ll_base()[lc] as u64), lb[lc] as u64)
+                bw.add(sml[i] as u64 - (ml_base()[mc] as u64), mb[mc] as u64)
+                bw.add(ob - (1 << (oc as u64)), oc as u64)
+            }
+            bw.add(sm as u64, mlt.log as u64)
+            bw.add(so as u64, oft.log as u64)
+            bw.add(sl as u64, llt.log as u64)
+            bw.close()
+            body.extend(bw.out)
+        }
+        if body.len() + 3 >= n + 3 || body.len() >= ZWIN {
+            self.raw_block(from, to, last, inout out)
+            return
+        }
+        let lastbit: u64 = if last { 1 } else { 0 }
+        put_le(inout out, lastbit | (2 << 1) | ((body.len() as u64) << 3), 3)
+        out.extend(body)
+    }
+
+    // After a block: the window slides when the buffer is long, keeping the chains right.
+    fn slide(inout self) {
+        if self.bstart < 2 * ZWIN { return }
+        let shift = ZWIN
+        self.buf.remove_range(0, shift)
+        self.bstart -= shift
+        let sh = shift as i32
+        for i in 0..ZHASH {
+            let v = self.head[i].copy()
+            self.head[i] = if v >= sh { v - sh } else { -1 }
+        }
+        for i in 0..ZWIN {
+            let v = self.prev[i].copy()
+            self.prev[i] = if v >= sh { v - sh } else { -1 }
+        }
+    }
+
+    // Encodes the pending input as blocks of at most BLOCK_MAX; `all` includes a last short one.
+    fn drain(inout self, all: bool, last: bool, inout out: List[u8]) {
+        while self.buf.len() - self.bstart > BLOCK_MAX || (all && self.buf.len() > self.bstart) {
+            let n = self.buf.len() - self.bstart
+            let take = if n > BLOCK_MAX { BLOCK_MAX } else { n }
+            let from = self.bstart.copy()
+            let is_last = last && take == n
+            self.block(from, from + take, is_last, inout out)
+            self.bstart = from + take
+            self.slide()
+            if is_last { return }
+        }
+        if last && !all { return }
+    }
+
+    /// Adds `data`; appends the blocks that are complete to `out`.
+    fn write(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state != 0 { return Err(compression.error(compression.Closed, "zstd: encoder is finished", self.in_total)) }
+        self.header(inout out)
+        self.in_total += data.len() as u64
+        self.csum.update(data)
+        self.buf.extend(data)
+        self.drain(false, false, inout out)
+        Ok(())
+    }
+
+    /// Writes out the buffered input as blocks, so a decoder can produce everything written so far.
+    fn flush(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state != 0 { return Err(compression.error(compression.Closed, "zstd: encoder is finished", self.in_total)) }
+        self.header(inout out)
+        self.drain(true, false, inout out)
+        Ok(())
+    }
+
+    /// Ends the frame: the last block and the content checksum.
+    fn finish(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.state != 0 { return Err(compression.error(compression.Closed, "zstd: encoder is finished", self.in_total)) }
+        self.header(inout out)
+        if self.buf.len() == self.bstart {
+            // nothing pending: an empty last block
+            put_le(inout out, 1, 3)
+        } else {
+            self.drain(true, true, inout out)
+        }
+        put_le(inout out, self.csum.value() & 4294967295, 4)
+        self.state = 1
+        Ok(())
+    }
+
+    fn finished(self) -> bool { self.state != 0 }
+}
+
+/// Compresses `data` to one zstd frame.
+pub fn compress(data: List[u8], level: i32) -> List[u8] {
+    let mut e = encoder(level)
+    let mut out: List[u8] = List.new()
+    match e.write(data, inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match e.finish(inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    out
+}

@@ -1,0 +1,154 @@
+// Decoding what the reference implementations (zlib, libzstd) produce: raw deflate in every block
+// type (stored, fixed, dynamic, Huffman-only, RLE), zlib, gzip (every header field, concatenated
+// members, zero padding), zstd (levels 1 to 19, raw/RLE/compressed blocks, 1 and 4 literal
+// streams, several frames, skippable frames). The vectors are tests/vectors.ei.
+
+import core.sys
+import compression
+import compression.deflate
+import compression.zlib
+import compression.zstd
+import compression.gzip
+import compression.tests.vectors as vectors
+import compression.tests.util as util
+
+fn key_of(name: str) -> str { name }
+
+fn all_inputs() -> List[str] { List["empty", "one", "hello", "text", "zeros", "bytes"] }
+
+fn show_err(e: compression.Error) -> String {
+    let mut s = String.from("error ")
+    s.append(e.to_string())
+    s
+}
+
+fn expect(name: String, r: Result[List[u8], compression.Error], want: List[u8], inout bad: i32) uses io {
+    util.expect(name, r, want, inout bad)
+}
+
+fn main() uses io {
+    // raw deflate
+    let mut bad = 0
+    let mut n = 0
+    for fam in List["raw0", "raw1", "raw6", "raw9", "fixed", "huff", "rle"] {
+        for k in all_inputs() {
+            n += 1
+            expect("{fam}_{k}", deflate.inflate(vectors.vs("{fam}_{k}")), util.input(k), inout bad)
+        }
+    }
+    print("raw deflate: {n} vectors, {bad} failures")
+
+    // zlib and gzip
+    bad = 0
+    n = 0
+    for k in all_inputs() {
+        n += 2
+        expect("zlib6_{k}", zlib.decompress(vectors.vs("zlib6_{k}")), util.input(k), inout bad)
+        expect("gz6_{k}", gzip.decompress(vectors.vs("gz6_{k}")), util.input(k), inout bad)
+    }
+    print("zlib and gzip: {n} vectors, {bad} failures")
+
+    // zstd
+    bad = 0
+    n = 0
+    for fam in List["zst1", "zst3", "zst19"] {
+        for k in all_inputs() {
+            n += 1
+            expect("{fam}_{k}", zstd.decompress(vectors.vs("{fam}_{k}")), util.input(k), inout bad)
+        }
+    }
+    print("zstd: {n} vectors, {bad} failures")
+
+    // bigger inputs: several blocks, 4 literal streams
+    let big = util.input("big")
+    match deflate.inflate(vectors.v("raw6_big")) {
+        Ok(o) => util.check("deflate 40000 bytes", util.same(o, big))
+        Err(e) => print("FAIL deflate big: {show_err(e)}")
+    }
+    for name in List["zst3_big", "zst19_big"] {
+        match zstd.decompress(vectors.v(name)) {
+            Ok(o) => util.check(name, util.same(o, big))
+            Err(e) => print("FAIL {name}: {show_err(e)}")
+        }
+    }
+
+    // gzip headers
+    let hello = util.input("hello")
+    match gzip.decompress(vectors.v("gz_name")) {
+        Ok(o) => util.check("gzip with a name", util.same(o, hello))
+        Err(e) => print("FAIL gz_name: {show_err(e)}")
+    }
+    let mut d = gzip.decoder(compression.limits())
+    let mut out: List[u8] = List.new()
+    match d.feed(vectors.v("gz_all"), inout out) {
+        Ok(_) => {
+            let h = d.header()
+            print("name {sys.to_string(h.name)} comment {sys.to_string(h.comment)} extra {util.hex(h.extra)} mtime {h.mtime} os {h.os}")
+            util.check("gzip with every header field and a header CRC", util.same(out, hello) && d.done())
+        }
+        Err(e) => print("FAIL gz_all: {show_err(e)}")
+    }
+    match gzip.decompress(vectors.v("gz_hcrc")) {
+        Ok(o) => util.check("gzip with a header CRC", util.same(o, hello))
+        Err(e) => print("FAIL gz_hcrc: {show_err(e)}")
+    }
+    let mut d2 = gzip.decoder(compression.limits())
+    let mut out2: List[u8] = List.new()
+    match d2.feed(vectors.v("gz_two"), inout out2) {
+        Ok(_) => {
+            let mut want = hello.copy()
+            want.extend(util.input("text"))
+            util.check("two gzip members", util.same(out2, want) && d2.members() == 2)
+        }
+        Err(e) => print("FAIL gz_two: {show_err(e)}")
+    }
+    match gzip.decompress(vectors.v("gz_pad")) {
+        Ok(o) => util.check("zero padding after a member", util.same(o, hello))
+        Err(e) => print("FAIL gz_pad: {show_err(e)}")
+    }
+    let mut d3 = gzip.decoder(compression.limits())
+    d3.single_member()
+    let mut out3: List[u8] = List.new()
+    match d3.feed(vectors.v("gz_two"), inout out3) {
+        Ok(_) => print("FAIL single member: accepted a second one")
+        Err(e) => print("single member, second member: {e.kind} at {e.offset}")
+    }
+
+    // zlib variants
+    for name in List["zlib_level1", "zlib_level9"] {
+        match zlib.decompress(vectors.v(name)) {
+            Ok(o) => util.check(name, util.same(o, hello))
+            Err(e) => print("FAIL {name}: {show_err(e)}")
+        }
+    }
+    match zlib.decompress(vectors.v("zlib_dict")) {
+        Ok(_) => print("FAIL zlib_dict: decoded without the dictionary")
+        Err(e) => print("zlib stream with a preset dictionary, none given: {e.kind}")
+    }
+    let mut zd = zlib.decoder_with_dictionary(compression.limits(), vectors.v("zlib_dict_input"))
+    let mut zo: List[u8] = List.new()
+    match zd.feed(vectors.v("zlib_dict"), inout zo) {
+        Ok(_) => util.check("zlib stream with a preset dictionary", util.same(zo, hello) && zd.done())
+        Err(e) => print("FAIL zlib_dict: {show_err(e)}")
+    }
+    let mut zw = zlib.decoder_with_dictionary(compression.limits(), sys.lit("not the dictionary"))
+    let mut zo2: List[u8] = List.new()
+    match zw.feed(vectors.v("zlib_dict"), inout zo2) {
+        Ok(_) => print("FAIL zlib_dict: wrong dictionary accepted")
+        Err(e) => print("zlib stream, wrong dictionary: {e.kind}")
+    }
+
+    // zstd frames
+    match zstd.decompress(vectors.v("zst_two_frames")) {
+        Ok(o) => {
+            let mut want = hello.copy()
+            want.extend(util.input("text"))
+            util.check("two zstd frames", util.same(o, want))
+        }
+        Err(e) => print("FAIL zst_two_frames: {show_err(e)}")
+    }
+    match zstd.decompress(vectors.v("zst_skippable")) {
+        Ok(o) => util.check("a skippable frame, then a frame", util.same(o, hello))
+        Err(e) => print("FAIL zst_skippable: {show_err(e)}")
+    }
+}

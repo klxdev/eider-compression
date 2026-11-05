@@ -156,6 +156,7 @@ impl Decoder {
                 self.info.extra.push(b)
                 self.hcnt += 1
                 if self.hcnt == self.xlen {
+                    self.hcnt = 0
                     let next = self.after(H_EXTRA)
                     if next == H_FIXED { return Ok(true) }
                     self.hstate = next

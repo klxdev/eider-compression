@@ -158,8 +158,9 @@ fn fixed_lit() -> Huff {
 }
 
 fn fixed_dist() -> Huff {
-    let lens: List[u8] = List.filled(5, 30)
-    huff_build(lens, 0, 30).unwrap()
+    // 32 codes of 5 bits: the last two never occur in a valid stream, but belong to the code
+    let lens: List[u8] = List.filled(5, 32)
+    huff_build(lens, 0, 32).unwrap()
 }
 
 // ---- the Inflater

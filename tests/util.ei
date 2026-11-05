@@ -1,0 +1,139 @@
+// Helpers of the tests: the inputs of tests/vectors.ei (made the same way as in scripts/gen-vectors.py),
+// a deterministic generator for data, and small printing helpers.
+
+import core.sys
+import std.encoding
+import compression
+
+/// The LCG of scripts/gen-vectors.py (Knuth's MMIX constants, top 31 bits).
+pub type Rng = { s: u64 }
+
+pub fn rng(seed: u64) -> Rng { Rng(seed) }
+
+pub fn next(inout r: Rng) -> u64 {
+    r.s = r.s *% 6364136223846793005 +% 1442695040888963407
+    r.s >> 33
+}
+
+fn words() -> List[str] {
+    List["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "eider", "duck", "down", "compression", "stream", "block", "window", "literal", "match", "offset", "length", "table"]
+}
+
+/// Word-salad text of `n` bytes (the same as the vectors' `text(n, seed)`).
+pub fn text(n: usize, seed: u64) -> List[u8] {
+    let mut g = rng(seed)
+    let w = words()
+    let mut out: List[u8] = List.new()
+    while out.len() < n {
+        let i = (next(inout g) % 20) as usize
+        for c in w[i].bytes() { out.push(c) }
+        if next(inout g) % 9 == 0 { out.push(10) } else { out.push(32) }
+    }
+    out.truncate(n)
+    out
+}
+
+/// Bytes that do not compress.
+pub fn noise(n: usize, seed: u64) -> List[u8] {
+    let mut g = rng(seed)
+    let mut out: List[u8] = List.new()
+    while out.len() < n { out.push((next(inout g) & 255) as u8) }
+    out
+}
+
+/// Text with runs and noise in it.
+pub fn mixed(n: usize, seed: u64) -> List[u8] {
+    let mut g = rng(seed)
+    let mut out: List[u8] = List.new()
+    while out.len() < n {
+        let k = next(inout g) % 4
+        let len = (next(inout g) % 300) as usize + 1
+        if k == 0 {
+            let t = text(len, next(inout g))
+            out.extend(t)
+        } else if k == 1 {
+            let b = (next(inout g) & 255) as u8
+            let mut i: usize = 0
+            while i < len {
+                out.push(b)
+                i += 1
+            }
+        } else if k == 2 {
+            let t = noise(len, next(inout g))
+            out.extend(t)
+        } else if out.len() > 10 {
+            // a copy from far back
+            let from = (next(inout g) as usize) % out.len()
+            let mut i: usize = 0
+            while i < len && from + i < out.len() {
+                out.push(out[from + i])
+                i += 1
+            }
+        }
+    }
+    out.truncate(n)
+    out
+}
+
+pub fn zeros(n: usize) -> List[u8] { List.filled(0, n) }
+
+/// The named input of the vectors.
+pub fn input(name: str) -> List[u8] {
+    if name == "empty" { return List.new() }
+    if name == "one" { return sys.lit("a") }
+    if name == "hello" {
+        let mut out: List[u8] = List.new()
+        let mut i = 0
+        while i < 10 {
+            out.extend(sys.lit("Hello, hello, hello, world! "))
+            i += 1
+        }
+        return out
+    }
+    if name == "text" { return text(3000, 7) }
+    if name == "zeros" { return zeros(5000) }
+    if name == "bytes" {
+        let mut out: List[u8] = List.new()
+        let mut i = 0
+        while i < 768 {
+            out.push((i % 256) as u8)
+            i += 1
+        }
+        return out
+    }
+    if name == "big" { return text(40000, 11) }
+    List.new()
+}
+
+pub fn same(a: List[u8], b: List[u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let mut i: usize = 0
+    while i < a.len() {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    true
+}
+
+/// `name: ok` or `name: FAIL ...`
+pub fn check(name: str, ok: bool) uses io {
+    if ok { print("ok   {name}") } else { print("FAIL {name}") }
+}
+
+pub fn hex(b: List[u8]) -> String { encoding.hex(b) }
+
+/// Counts a failure (printing it) unless `r` is `Ok(want)`.
+pub fn expect(name: String, r: Result[List[u8], compression.Error], want: List[u8], inout bad: i32) uses io {
+    match r {
+        Ok(o) => {
+            if !same(o, want) {
+                print("FAIL {name}: wrong output")
+                bad += 1
+            }
+        }
+        Err(e) => {
+            print("FAIL {name}: {e.kind} {e}")
+            bad += 1
+        }
+    }
+}

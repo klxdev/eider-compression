@@ -1,0 +1,374 @@
+//! compression.codec: one interface over gzip, zlib, raw deflate and zstd, chosen at run time,
+//! for what HTTP calls a content coding (RFC 9110 "Content-Encoding"), a file's extension, or
+//! the first bytes of a stream.
+//!
+//! `format_of(name)` maps a coding name (`gzip`, `x-gzip`, `deflate`, `zstd`, `identity`) to a
+//! `Format`; `Decoder` and `Encoder` run any format in chunks; `decode` and `encode` do a whole
+//! buffer; `detect(head)` guesses the format of a stream from its first bytes.
+//!
+//! `Deflate` is what the `deflate` coding really is in the wild: zlib framing (what RFC 9110
+//! says) or, from some servers, a raw deflate stream; a Decoder tells them apart by the header.
+
+import compression
+import compression.deflate as deflate
+import compression.gzip as gzip
+import compression.zlib as zlib
+import compression.zstd as zstd
+
+/// The formats. `Deflate` decodes zlib or raw deflate (by the header) and encodes zlib. `Auto`
+/// decodes any of them by the first bytes. `Identity` copies.
+pub type Format =
+    | Gzip
+    | Zlib
+    | Raw
+    | Deflate
+    | Zstd
+    | Identity
+    | Auto
+
+/// The format a Content-Encoding (or Accept-Encoding) token names, ignoring case; None for
+/// others (`br`, `compress`, ...).
+pub fn format_of(name: List[u8]) -> Option[Format] {
+    let mut low: List[u8] = List.new()
+    for c in name {
+        low.push(if c >= 65 && c <= 90 { c + 32 } else { c })
+    }
+    if eq(low, "gzip") || eq(low, "x-gzip") { return Some(Gzip) }
+    if eq(low, "deflate") { return Some(Deflate) }
+    if eq(low, "zstd") { return Some(Zstd) }
+    if eq(low, "identity") { return Some(Identity) }
+    None
+}
+
+fn eq(b: List[u8], s: str) -> bool {
+    let t = s.bytes()
+    if b.len() != t.len() { return false }
+    for i in 0..b.len() {
+        if b[i] != t[i] { return false }
+    }
+    true
+}
+
+/// The token to send in Content-Encoding for `f` (`Raw` and `Auto` have none: `deflate` and
+/// `identity`).
+pub fn name(f: Format) -> str {
+    match f {
+        Gzip => "gzip"
+        Zlib => "deflate"
+        Raw => "deflate"
+        Deflate => "deflate"
+        Zstd => "zstd"
+        Identity => "identity"
+        Auto => "identity"
+    }
+}
+
+/// The format of a stream from its first bytes (at least 4 help): gzip and zstd by their magic
+/// numbers, zlib by a valid header, else raw deflate. None if `head` is empty.
+pub fn detect(head: List[u8]) -> Option[Format] {
+    if head.len() == 0 { return None }
+    if head.len() >= 2 && head[0] == 31 && head[1] == 139 { return Some(Gzip) }
+    if head.len() >= 4 && head[0] == 40 && head[1] == 181 && head[2] == 47 && head[3] == 253 { return Some(Zstd) }
+    if head.len() >= 2 && (head[0] & 15) == 8 && (head[0] >> 4) <= 7 && (((head[0] as u32) << 8) | (head[1] as u32)) % 31 == 0 {
+        return Some(Zlib)
+    }
+    Some(Raw)
+}
+
+type Dec =
+    | None_
+    | G(gzip.Decoder)
+    | Z(zlib.Decoder)
+    | R(deflate.Inflater)
+    | S(zstd.Decoder)
+    | Copy
+
+/// A decoder for any format. Make one with `decoder(format, limits)`.
+pub type Decoder = { fmt: Format, lim: compression.Limits, d: Dec, head: List[u8], fed: u64 }
+
+pub fn decoder(fmt: Format, lim: compression.Limits) -> Decoder {
+    let mut x = Decoder(fmt, lim, None_, List.new(), 0)
+    match fmt {
+        Gzip => { x.d = G(gzip.decoder(lim)) }
+        Zlib => { x.d = Z(zlib.decoder(lim)) }
+        Raw => { x.d = R(deflate.inflater(lim)) }
+        Zstd => { x.d = S(zstd.decoder(lim)) }
+        Identity => { x.d = Copy }
+        Deflate => {}
+        Auto => {}
+    }
+    x
+}
+
+fn started(d: Dec) -> bool {
+    match d {
+        None_ => false
+        _ => true
+    }
+}
+
+impl Decoder {
+    /// Adds a chunk of input and appends what it decodes to `out`.
+    fn feed(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        self.fed += data.len() as u64
+        if !started(self.d) {
+            // Deflate and Auto: decide on the first four bytes
+            self.head.extend(data)
+            if self.head.len() < 4 { return Ok(()) }
+            let all = self.head.copy()
+            self.head.clear()
+            self.choose(all)
+            return self.step(all, inout out)
+        }
+        self.step(data, inout out)
+    }
+
+    // Picks the format of a stream from its first bytes.
+    fn choose(inout self, head: List[u8]) {
+        let chosen = detect(head).unwrap()
+        let mut f = chosen.copy()
+        if self.fmt == Deflate && chosen != Zlib { f = Raw }
+        self.start(f)
+    }
+
+    fn start(inout self, f: Format) {
+        match f {
+            Gzip => { self.d = G(gzip.decoder(self.lim)) }
+            Zlib => { self.d = Z(zlib.decoder(self.lim)) }
+            Raw => { self.d = R(deflate.inflater(self.lim)) }
+            Zstd => { self.d = S(zstd.decoder(self.lim)) }
+            _ => { self.d = Copy }
+        }
+    }
+
+    fn step(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        let mut cur = self.d.copy()
+        self.d = None_
+        match cur {
+            G(mut x) => {
+                let r = x.feed(data, inout out)
+                self.d = G(x)
+                r
+            }
+            Z(mut x) => {
+                let r = x.feed(data, inout out)
+                self.d = Z(x)
+                r
+            }
+            R(mut x) => {
+                let r = x.feed(data, inout out)
+                self.d = R(x)
+                if r.is_ok() && x.done() && x.rest().len() > 0 {
+                    return Err(compression.error(compression.Trailing, "deflate: data after the final block", self.fed))
+                }
+                r
+            }
+            S(mut x) => {
+                let r = x.feed(data, inout out)
+                self.d = S(x)
+                r
+            }
+            Copy => {
+                let room = compression.output_cap(self.lim, self.fed)
+                if (out.len() as u64) + (data.len() as u64) > room && self.lim.max_output != 0 {
+                    self.d = Copy
+                    return Err(compression.error(compression.TooLarge, "identity: output over the limit", self.fed))
+                }
+                out.extend(data)
+                self.d = Copy
+                Ok(())
+            }
+            None_ => Ok(())
+        }
+    }
+
+    /// No more input: Ok if the stream was complete, else `Truncated`.
+    fn finish(inout self) -> Result[(), compression.Error] {
+        if !started(self.d) {
+            // nothing, or fewer than four bytes
+            if self.head.len() == 0 { return Err(compression.error(compression.Truncated, "empty input", 0)) }
+            let all = self.head.copy()
+            self.choose(all)
+            self.head.clear()
+            let mut sink: List[u8] = List.new()
+            self.step(all, inout sink)?
+        }
+        let mut cur = self.d.copy()
+        self.d = None_
+        match cur {
+            G(mut x) => {
+                let r = x.finish()
+                self.d = G(x)
+                r
+            }
+            Z(mut x) => {
+                let r = x.finish()
+                self.d = Z(x)
+                r
+            }
+            R(mut x) => {
+                let r = x.finish()
+                self.d = R(x)
+                r
+            }
+            S(mut x) => {
+                let r = x.finish()
+                self.d = S(x)
+                r
+            }
+            _ => Ok(())
+        }
+    }
+}
+
+/// Decodes a whole buffer.
+pub fn decode(fmt: Format, data: List[u8], lim: compression.Limits) -> Result[List[u8], compression.Error] {
+    let mut d = decoder(fmt, lim)
+    let mut out: List[u8] = List.new()
+    d.feed(data, inout out)?
+    d.finish()?
+    Ok(out)
+}
+
+type Enc =
+    | EG(gzip.Encoder)
+    | EZ(zlib.Encoder)
+    | ER(deflate.Deflater)
+    | ES(zstd.Encoder)
+    | EC
+    | EN
+
+/// An encoder for any format that can be written: gzip, zlib (and `Deflate`), raw deflate,
+/// zstd, identity. Make one with `encoder(format, level)`.
+pub type Encoder = { e: Enc, copied: u64 }
+
+/// `level` means the format's own scale: 0 to 9 for gzip, zlib and deflate; 0 to 3 for zstd
+/// (see `zstd.encoder`). A negative level is the format's default.
+pub fn encoder(fmt: Format, level: i32) -> Encoder {
+    match fmt {
+        Gzip => Encoder(EG(gzip.encoder(level)), 0)
+        Zlib => Encoder(EZ(zlib.encoder(level)), 0)
+        Deflate => Encoder(EZ(zlib.encoder(level)), 0)
+        Raw => Encoder(ER(deflate.deflater(level)), 0)
+        Zstd => Encoder(ES(zstd.encoder(level)), 0)
+        Identity => Encoder(EC, 0)
+        Auto => Encoder(EC, 0)
+    }
+}
+
+impl Encoder {
+    /// Compresses `data`; appends what is ready to `out`.
+    fn write(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        let mut cur = self.e.copy()
+        self.e = EN
+        match cur {
+            EG(mut x) => {
+                let r = x.write(data, inout out)
+                self.e = EG(x)
+                r
+            }
+            EZ(mut x) => {
+                let r = x.write(data, inout out)
+                self.e = EZ(x)
+                r
+            }
+            ER(mut x) => {
+                let r = x.write(data, inout out)
+                self.e = ER(x)
+                r
+            }
+            ES(mut x) => {
+                let r = x.write(data, inout out)
+                self.e = ES(x)
+                r
+            }
+            EC => {
+                out.extend(data)
+                self.e = EC
+                Ok(())
+            }
+            EN => Ok(())
+        }
+    }
+
+    /// Makes everything written so far decodable from the output so far (a sync flush).
+    fn flush(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        let mut cur = self.e.copy()
+        self.e = EN
+        match cur {
+            EG(mut x) => {
+                let r = x.flush(inout out)
+                self.e = EG(x)
+                r
+            }
+            EZ(mut x) => {
+                let r = x.flush(inout out)
+                self.e = EZ(x)
+                r
+            }
+            ER(mut x) => {
+                let r = x.flush(inout out)
+                self.e = ER(x)
+                r
+            }
+            ES(mut x) => {
+                let r = x.flush(inout out)
+                self.e = ES(x)
+                r
+            }
+            EC => {
+                self.e = EC
+                Ok(())
+            }
+            EN => Ok(())
+        }
+    }
+
+    /// Ends the stream.
+    fn finish(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        let mut cur = self.e.copy()
+        self.e = EN
+        match cur {
+            EG(mut x) => {
+                let r = x.finish(inout out)
+                self.e = EG(x)
+                r
+            }
+            EZ(mut x) => {
+                let r = x.finish(inout out)
+                self.e = EZ(x)
+                r
+            }
+            ER(mut x) => {
+                let r = x.finish(inout out)
+                self.e = ER(x)
+                r
+            }
+            ES(mut x) => {
+                let r = x.finish(inout out)
+                self.e = ES(x)
+                r
+            }
+            EC => {
+                self.e = EC
+                Ok(())
+            }
+            EN => Ok(())
+        }
+    }
+}
+
+/// Encodes a whole buffer.
+pub fn encode(fmt: Format, data: List[u8], level: i32) -> List[u8] {
+    let mut e = encoder(fmt, level)
+    let mut out: List[u8] = List.new()
+    match e.write(data, inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match e.finish(inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    out
+}

@@ -1,0 +1,206 @@
+//! compression.streams: `std/stream` Readers and Writers that decode and encode as they go.
+//!
+//! `decode_reader(r, format, limits)` wraps a Reader of compressed bytes into a Reader of the
+//! decoded bytes; `encode_writer(w, format, level)` wraps a Writer into one that takes plain
+//! bytes and writes compressed ones. Both work in chunks, hold no more than one chunk's output
+//! (a decoded chunk is bounded by the limits), and report problems as `stream.Error`s: kind
+//! `UnexpectedEof` for a truncated stream, `InvalidData` for any other decoding error (the
+//! message has the details and the offset).
+//!
+//! A compressed HTTP request body is read this way (`eider-http`'s `http.Body` is a Reader), a
+//! compressed response is written with an encode writer around the response stream; the README
+//! shows both.
+
+import std.stream
+import std.time
+import compression
+import compression.codec as codec
+
+fn stream_error(e: compression.Error) -> stream.Error {
+    let kind = match e.kind {
+        compression.Truncated => stream.UnexpectedEof
+        _ => stream.InvalidData
+    }
+    stream.error_text(kind, e.to_string())
+}
+
+/// Reads the decoded bytes of a compressed Reader.
+pub type DecodeReader[R] = { inner: R, dec: codec.Decoder, out: List[u8], opos: usize, eof: bool, chunk: usize }
+
+/// A Reader of the decoded bytes of `r`, in `format`, under the limits `lim`. It reads `r` in
+/// pieces of 4 KiB, so that a bomb is stopped after at most one piece's output.
+pub fn decode_reader[R: stream.Reader](r: R, format: codec.Format, lim: compression.Limits) -> DecodeReader[R] {
+    DecodeReader(r, codec.decoder(format, lim), List.new(), 0, false, 4096)
+}
+
+impl[R: stream.Reader] DecodeReader[R] {
+    /// The Reader underneath.
+    fn inner(self) -> R { self.inner }
+
+    // Returns decoded bytes already held, if any.
+    fn take(inout self, max: usize) -> Option[List[u8]] {
+        if self.opos >= self.out.len() { return None }
+        let avail = self.out.len() - self.opos
+        let n = if avail < max { avail } else { max }
+        let part = self.out.slice(self.opos, self.opos + n)
+        self.opos += n
+        if self.opos >= self.out.len() {
+            self.out.clear()
+            self.opos = 0
+        }
+        Some(part)
+    }
+
+    // Takes in one more piece; false at the end of the stream.
+    fn pull(inout self, piece: List[u8]) -> Result[bool, stream.Error] {
+        if piece.len() == 0 {
+            self.eof = true
+            match self.dec.finish() {
+                Ok(_) => {}
+                Err(e) => { return Err(stream_error(e)) }
+            }
+            return Ok(false)
+        }
+        self.out.clear()
+        self.opos = 0
+        match self.dec.feed(piece, inout self.out) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        Ok(true)
+    }
+}
+
+impl[R: stream.Reader] stream.Reader for DecodeReader[R] {
+    fn read(inout self, max: usize) -> Result[List[u8], stream.Error] uses io {
+        if max == 0 { return Err(stream.error(stream.InvalidInput, "read: max must be at least 1")) }
+        while true {
+            match self.take(max) {
+                Some(p) => { return Ok(p) }
+                None => {}
+            }
+            if self.eof { return Ok(List.new()) }
+            let c = self.chunk.copy()
+            let piece = self.inner.read(c)?
+            self.pull(piece)?
+        }
+        Ok(List.new())
+    }
+
+    fn read_by(inout self, max: usize, dl: time.Deadline) -> Result[List[u8], stream.Error] uses io, clock {
+        if max == 0 { return Err(stream.error(stream.InvalidInput, "read: max must be at least 1")) }
+        while true {
+            match self.take(max) {
+                Some(p) => { return Ok(p) }
+                None => {}
+            }
+            if self.eof { return Ok(List.new()) }
+            let c = self.chunk.copy()
+            let piece = self.inner.read_by(c, dl)?
+            self.pull(piece)?
+        }
+        Ok(List.new())
+    }
+}
+
+/// Writes plain bytes as compressed bytes to a Writer. Call `close` when done: it writes the
+/// end of the stream (the last block and the checksum) and flushes.
+pub type EncodeWriter[W] = { inner: W, enc: codec.Encoder, scratch: List[u8], closed: bool }
+
+/// A Writer that compresses what is written to it in `format` (at `level`, see `codec.encoder`)
+/// and writes the result to `w`.
+pub fn encode_writer[W: stream.Writer](w: W, format: codec.Format, level: i32) -> EncodeWriter[W] {
+    EncodeWriter(w, codec.encoder(format, level), List.new(), false)
+}
+
+impl[W: stream.Writer] EncodeWriter[W] {
+    /// The Writer underneath.
+    fn inner(self) -> W { self.inner }
+
+    /// Ends the compressed stream and flushes the Writer underneath. Writing after `close` is an error.
+    fn close(inout self) -> Result[(), stream.Error] uses io {
+        if self.closed { return Ok(()) }
+        self.closed = true
+        self.scratch.clear()
+        match self.enc.finish(inout self.scratch) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        let data = self.scratch.copy()
+        stream.write_all(inout self.inner, data)?
+        self.inner.flush()
+    }
+
+    fn close_by(inout self, dl: time.Deadline) -> Result[(), stream.Error] uses io, clock {
+        if self.closed { return Ok(()) }
+        self.closed = true
+        self.scratch.clear()
+        match self.enc.finish(inout self.scratch) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        let data = self.scratch.copy()
+        stream.write_all_by(inout self.inner, data, dl)?
+        self.inner.flush_by(dl)
+    }
+}
+
+impl[W: stream.Writer] stream.Writer for EncodeWriter[W] {
+    fn write(inout self, data: List[u8]) -> Result[usize, stream.Error] uses io {
+        if self.closed { return Err(stream.error(stream.BrokenPipe, "write after close")) }
+        self.scratch.clear()
+        match self.enc.write(data, inout self.scratch) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        if self.scratch.len() > 0 {
+            let out = self.scratch.copy()
+            stream.write_all(inout self.inner, out)?
+        }
+        Ok(data.len())
+    }
+
+    fn write_by(inout self, data: List[u8], dl: time.Deadline) -> Result[usize, stream.Error] uses io, clock {
+        if self.closed { return Err(stream.error(stream.BrokenPipe, "write after close")) }
+        self.scratch.clear()
+        match self.enc.write(data, inout self.scratch) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        if self.scratch.len() > 0 {
+            let out = self.scratch.copy()
+            stream.write_all_by(inout self.inner, out, dl)?
+        }
+        Ok(data.len())
+    }
+
+    /// A sync flush: what was written so far reaches the Writer underneath and can be decoded
+    /// by the peer from what it has received.
+    fn flush(inout self) -> Result[(), stream.Error] uses io {
+        if self.closed { return Ok(()) }
+        self.scratch.clear()
+        match self.enc.flush(inout self.scratch) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        if self.scratch.len() > 0 {
+            let out = self.scratch.copy()
+            stream.write_all(inout self.inner, out)?
+        }
+        self.inner.flush()
+    }
+
+    fn flush_by(inout self, dl: time.Deadline) -> Result[(), stream.Error] uses io, clock {
+        if self.closed { return Ok(()) }
+        self.scratch.clear()
+        match self.enc.flush(inout self.scratch) {
+            Ok(_) => {}
+            Err(e) => { return Err(stream_error(e)) }
+        }
+        if self.scratch.len() > 0 {
+            let out = self.scratch.copy()
+            stream.write_all_by(inout self.inner, out, dl)?
+        }
+        self.inner.flush_by(dl)
+    }
+}
