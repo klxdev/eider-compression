@@ -485,7 +485,10 @@ impl Decoder {
     /// No more input: Ok if the last frame is complete (and there was one), else `Truncated`.
     fn finish(inout self) -> Result[(), compression.Error] {
         if self.phase == P_FAILED { return Err(self.failed()) }
-        if self.phase == P_MAGIC && self.frames > 0 && self.avail() == 0 { return Ok(()) }
+        if self.phase == P_MAGIC && self.frames > 0 {
+            if self.avail() == 0 { return Ok(()) }
+            return Err(fail(inout self, compression.Trailing, "zstd: data after the last frame"))
+        }
         Err(fail(inout self, compression.Truncated, "zstd: stream ends before the end of the frame"))
     }
 

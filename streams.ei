@@ -61,9 +61,11 @@ impl[R: stream.Reader] DecodeReader[R] {
             }
             return Ok(false)
         }
-        self.out.clear()
+        let mut fresh: List[u8] = List.new()
+        let r = self.dec.feed(piece, inout fresh)
+        self.out = fresh
         self.opos = 0
-        match self.dec.feed(piece, inout self.out) {
+        match r {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
@@ -105,12 +107,12 @@ impl[R: stream.Reader] stream.Reader for DecodeReader[R] {
 
 /// Writes plain bytes as compressed bytes to a Writer. Call `close` when done: it writes the
 /// end of the stream (the last block and the checksum) and flushes.
-pub type EncodeWriter[W] = { inner: W, enc: codec.Encoder, scratch: List[u8], closed: bool }
+pub type EncodeWriter[W] = { inner: W, enc: codec.Encoder, closed: bool }
 
 /// A Writer that compresses what is written to it in `format` (at `level`, see `codec.encoder`)
 /// and writes the result to `w`.
 pub fn encode_writer[W: stream.Writer](w: W, format: codec.Format, level: i32) -> EncodeWriter[W] {
-    EncodeWriter(w, codec.encoder(format, level), List.new(), false)
+    EncodeWriter(w, codec.encoder(format, level), false)
 }
 
 impl[W: stream.Writer] EncodeWriter[W] {
@@ -121,12 +123,12 @@ impl[W: stream.Writer] EncodeWriter[W] {
     fn close(inout self) -> Result[(), stream.Error] uses io {
         if self.closed { return Ok(()) }
         self.closed = true
-        self.scratch.clear()
-        match self.enc.finish(inout self.scratch) {
+        let mut tmp: List[u8] = List.new()
+        match self.enc.finish(inout tmp) {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
-        let data = self.scratch.copy()
+        let data = tmp
         stream.write_all(inout self.inner, data)?
         self.inner.flush()
     }
@@ -134,12 +136,12 @@ impl[W: stream.Writer] EncodeWriter[W] {
     fn close_by(inout self, dl: time.Deadline) -> Result[(), stream.Error] uses io, clock {
         if self.closed { return Ok(()) }
         self.closed = true
-        self.scratch.clear()
-        match self.enc.finish(inout self.scratch) {
+        let mut tmp: List[u8] = List.new()
+        match self.enc.finish(inout tmp) {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
-        let data = self.scratch.copy()
+        let data = tmp
         stream.write_all_by(inout self.inner, data, dl)?
         self.inner.flush_by(dl)
     }
@@ -148,13 +150,13 @@ impl[W: stream.Writer] EncodeWriter[W] {
 impl[W: stream.Writer] stream.Writer for EncodeWriter[W] {
     fn write(inout self, data: List[u8]) -> Result[usize, stream.Error] uses io {
         if self.closed { return Err(stream.error(stream.BrokenPipe, "write after close")) }
-        self.scratch.clear()
-        match self.enc.write(data, inout self.scratch) {
+        let mut tmp: List[u8] = List.new()
+        match self.enc.write(data, inout tmp) {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
-        if self.scratch.len() > 0 {
-            let out = self.scratch.copy()
+        if tmp.len() > 0 {
+            let out = tmp
             stream.write_all(inout self.inner, out)?
         }
         Ok(data.len())
@@ -162,13 +164,13 @@ impl[W: stream.Writer] stream.Writer for EncodeWriter[W] {
 
     fn write_by(inout self, data: List[u8], dl: time.Deadline) -> Result[usize, stream.Error] uses io, clock {
         if self.closed { return Err(stream.error(stream.BrokenPipe, "write after close")) }
-        self.scratch.clear()
-        match self.enc.write(data, inout self.scratch) {
+        let mut tmp: List[u8] = List.new()
+        match self.enc.write(data, inout tmp) {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
-        if self.scratch.len() > 0 {
-            let out = self.scratch.copy()
+        if tmp.len() > 0 {
+            let out = tmp
             stream.write_all_by(inout self.inner, out, dl)?
         }
         Ok(data.len())
@@ -178,13 +180,13 @@ impl[W: stream.Writer] stream.Writer for EncodeWriter[W] {
     /// by the peer from what it has received.
     fn flush(inout self) -> Result[(), stream.Error] uses io {
         if self.closed { return Ok(()) }
-        self.scratch.clear()
-        match self.enc.flush(inout self.scratch) {
+        let mut tmp: List[u8] = List.new()
+        match self.enc.flush(inout tmp) {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
-        if self.scratch.len() > 0 {
-            let out = self.scratch.copy()
+        if tmp.len() > 0 {
+            let out = tmp
             stream.write_all(inout self.inner, out)?
         }
         self.inner.flush()
@@ -192,13 +194,13 @@ impl[W: stream.Writer] stream.Writer for EncodeWriter[W] {
 
     fn flush_by(inout self, dl: time.Deadline) -> Result[(), stream.Error] uses io, clock {
         if self.closed { return Ok(()) }
-        self.scratch.clear()
-        match self.enc.flush(inout self.scratch) {
+        let mut tmp: List[u8] = List.new()
+        match self.enc.flush(inout tmp) {
             Ok(_) => {}
             Err(e) => { return Err(stream_error(e)) }
         }
-        if self.scratch.len() > 0 {
-            let out = self.scratch.copy()
+        if tmp.len() > 0 {
+            let out = tmp
             stream.write_all_by(inout self.inner, out, dl)?
         }
         self.inner.flush_by(dl)

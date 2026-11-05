@@ -1,0 +1,182 @@
+// Hostile input: malformed streams (every one an Err of the right kind, none a trap), truncation at
+// every byte, every byte of a stream altered, and the limits against decompression bombs.
+
+import core.sys
+import compression
+import compression.deflate
+import compression.zlib
+import compression.gzip
+import compression.zstd
+import compression.codec as codec
+import compression.tests.vectors as vectors
+import compression.tests.util as util
+
+fn kind_of(r: Result[List[u8], compression.Error]) -> String {
+    match r {
+        Ok(_) => String.from("OK")
+        Err(e) => {
+            let mut s = String.from("")
+            s.append(e.kind.to_string())
+            s
+        }
+    }
+}
+
+fn row(name: str, got: String, want: str) uses io {
+    if got == String.from(want) {
+        print("ok   {name}: {got}")
+    } else {
+        print("FAIL {name}: {got}, wanted {want}")
+    }
+}
+
+fn main() uses io {
+    let lim = compression.limits()
+    // ---- malformed deflate
+    row("block type 3", kind_of(deflate.inflate(vectors.v("bad_blocktype"))), "Corrupt")
+    row("stored block, LEN and NLEN disagree", kind_of(deflate.inflate(vectors.v("bad_stored"))), "Corrupt")
+    row("match before the start", kind_of(deflate.inflate(vectors.v("bad_dist"))), "Corrupt")
+    row("length symbol 286", kind_of(deflate.inflate(vectors.v("bad_sym286"))), "Corrupt")
+    row("distance symbol 30", kind_of(deflate.inflate(vectors.v("bad_dist30"))), "Corrupt")
+    row("HLIT over 286", kind_of(deflate.inflate(vectors.v("bad_hlit"))), "Corrupt")
+    row("over-subscribed code length code", kind_of(deflate.inflate(vectors.v("bad_oversub"))), "Corrupt")
+    row("repeat with no previous length", kind_of(deflate.inflate(vectors.v("bad_repeat"))), "Corrupt")
+    let good = vectors.v("raw6_text")
+    let mut extra = good.copy()
+    extra.push(0)
+    row("byte after the final block", kind_of(deflate.inflate(extra)), "Trailing")
+    row("nothing", kind_of(deflate.inflate(List.new())), "Truncated")
+
+    // ---- malformed zlib
+    row("zlib header check", kind_of(zlib.decompress(vectors.v("bad_zlib_check"))), "Corrupt")
+    row("zlib method", kind_of(zlib.decompress(vectors.v("bad_zlib_method"))), "Corrupt")
+    row("zlib Adler-32", kind_of(zlib.decompress(vectors.v("bad_zlib_adler"))), "Checksum")
+    row("zlib trailing byte", kind_of(zlib.decompress(vectors.v("bad_zlib_trailing"))), "Trailing")
+    row("zlib preset dictionary", kind_of(zlib.decompress(vectors.v("zlib_dict"))), "Dictionary")
+
+    // ---- malformed gzip
+    row("gzip magic", kind_of(gzip.decompress(vectors.v("bad_gz_magic"))), "Corrupt")
+    row("gzip method", kind_of(gzip.decompress(vectors.v("bad_gz_method"))), "Unsupported")
+    row("gzip reserved flags", kind_of(gzip.decompress(vectors.v("bad_gz_flags"))), "Unsupported")
+    row("gzip CRC-32", kind_of(gzip.decompress(vectors.v("bad_gz_crc"))), "Checksum")
+    row("gzip length", kind_of(gzip.decompress(vectors.v("bad_gz_size"))), "Checksum")
+    row("gzip header CRC", kind_of(gzip.decompress(vectors.v("bad_gz_hcrc"))), "Checksum")
+    row("gzip garbage after the member", kind_of(gzip.decompress(vectors.v("bad_gz_garbage"))), "Trailing")
+    // a header with a name that never ends
+    let mut longname = vectors.v("gz6_hello").slice(0, 3)
+    longname.push(8)
+    for i in 0..6 { longname.push(0) }
+    for i in 0..70000 { longname.push(65) }
+    row("gzip header over the limit", kind_of(gzip.decompress(longname)), "TooLarge")
+
+    // ---- malformed zstd
+    row("zstd magic", kind_of(zstd.decompress(vectors.v("bad_zst_magic"))), "Corrupt")
+    row("zstd content checksum", kind_of(zstd.decompress(vectors.v("bad_zst_csum"))), "Checksum")
+    row("zstd reserved header bit", kind_of(zstd.decompress(vectors.v("bad_zst_reserved"))), "Corrupt")
+    row("zstd window over the limit", kind_of(zstd.decompress(vectors.v("bad_zst_window"))), "TooLarge")
+    row("zstd declared size over the limit", kind_of(zstd.decompress(vectors.v("bad_zst_fcs"))), "TooLarge")
+    row("zstd dictionary", kind_of(zstd.decompress(vectors.v("bad_zst_dict"))), "Dictionary")
+    row("zstd reserved block type", kind_of(zstd.decompress(vectors.v("bad_zst_blocktype"))), "Corrupt")
+    row("zstd block over 128 KiB", kind_of(zstd.decompress(vectors.v("bad_zst_blocksize"))), "Corrupt")
+    row("zstd header cut short", kind_of(zstd.decompress(vectors.v("bad_zst_short"))), "Truncated")
+    row("zstd content size does not match", kind_of(zstd.decompress(vectors.v("bad_zst_fcs_mismatch"))), "Corrupt")
+    let mut zextra = vectors.v("zst1_hello").copy()
+    zextra.push(1)
+    row("zstd bytes after the frame", kind_of(zstd.decompress(zextra)), "Trailing")
+
+    // ---- truncation at every length: never Ok, never a trap
+    let cases: List[String] = List[String.from("raw6_text"), String.from("zlib6_text"), String.from("gz6_text"), String.from("zst1_text"), String.from("zst19_text")]
+    for name in cases {
+        let v = vectors.vs(name.copy())
+        let mut oks = 0
+        let mut n = 0
+        let f: codec.Format = if name == String.from("raw6_text") { codec.Raw } else if name == String.from("zlib6_text") { codec.Zlib } else if name == String.from("gz6_text") { codec.Gzip } else { codec.Zstd }
+        for cut in 0..v.len() {
+            n += 1
+            match codec.decode(f, v.slice(0, cut), lim) {
+                Ok(_) => { oks += 1 }
+                Err(_) => {}
+            }
+        }
+        print("{name}: {n} truncations, {oks} decoded")
+    }
+
+    // ---- every byte altered: no trap, and for the checked formats never wrong output
+    for name in cases {
+        let v = vectors.vs(name.copy())
+        let checked = !(name == String.from("raw6_text"))
+        let f: codec.Format = if name == String.from("raw6_text") { codec.Raw } else if name == String.from("zlib6_text") { codec.Zlib } else if name == String.from("gz6_text") { codec.Gzip } else { codec.Zstd }
+        let want = util.input("text")
+        let mut errs = 0
+        let mut same_out = 0
+        let mut wrong = 0
+        let mut n = 0
+        for i in 0..v.len() {
+            let mut k = 0
+            while k < 3 {
+                let mut m = v.copy()
+                if k == 0 { m[i] = m[i] ^ 255 }
+                if k == 1 { m[i] = m[i] ^ 1 }
+                if k == 2 { m[i] = m[i] ^ 128 }
+                n += 1
+                match codec.decode(f, m, compression.limit_output(4000000)) {
+                    Ok(o) => {
+                        if util.same(o, want) { same_out += 1 } else { wrong += 1 }
+                    }
+                    Err(_) => { errs += 1 }
+                }
+                k += 1
+            }
+        }
+        if checked {
+            print("{name}: {n} altered streams, none decoded to wrong data: {wrong == 0}")
+        } else {
+            print("{name}: {n} altered streams, none trapped")
+        }
+    }
+
+    // ---- bombs
+    let zgz = vectors.v("zeros_gz")
+    let zraw = vectors.v("zeros_raw")
+    print("a bomb of {zgz.len()} bytes, 5 MB when decoded")
+    row("gzip bomb, default limits (64 MiB)", kind_of(gzip.decompress(zgz)), "OK")
+    row("gzip bomb, 1 MB limit", kind_of(gzip.decompress_with(zgz, compression.limit_output(1000000))), "TooLarge")
+    row("deflate bomb, 1 MB limit", kind_of(deflate.inflate_with(zraw, compression.limit_output(1000000))), "TooLarge")
+    let mut ratio = compression.limits()
+    ratio.max_ratio = 100
+    ratio.ratio_floor = 10000
+    row("gzip bomb, ratio 100", kind_of(gzip.decompress_with(zgz, ratio)), "RatioExceeded")
+    row("deflate bomb, ratio 100", kind_of(deflate.inflate_with(zraw, ratio)), "RatioExceeded")
+    row("gzip bomb, no limits", kind_of(gzip.decompress_with(zgz, compression.unlimited())), "OK")
+    // the output stays within the limit, even while the error is reported
+    let mut d = gzip.decoder(compression.limit_output(300000))
+    let mut out: List[u8] = List.new()
+    let r = d.feed(zgz, inout out)
+    print("output held when the limit hit: {out.len() <= 300000}")
+    match r {
+        Ok(_) => print("FAIL: no error")
+        Err(e) => print("error after the limit: {e.kind}, and the decoder stays failed: {d.feed(zgz, inout out).is_err()}")
+    }
+    // many small members
+    let one = vectors.v("gz6_hello")
+    let mut many: List[u8] = List.new()
+    for i in 0..300 { many.extend(one) }
+    row("300 members, limit under their total", kind_of(gzip.decompress_with(many, compression.limit_output(5000))), "TooLarge")
+    row("300 members, within the limit", kind_of(gzip.decompress_with(many, compression.limit_output(100000))), "OK")
+
+    let rle = vectors.v("zst_rle_bomb")
+    print("a zstd frame of {rle.len()} bytes, 25 MiB when decoded")
+    row("zstd RLE bomb, default limits (ratio)", kind_of(zstd.decompress(rle)), "RatioExceeded")
+    row("zstd RLE bomb, 1 MB limit", kind_of(zstd.decompress_with(rle, compression.limit_output(1000000))), "TooLarge")
+    let mut zl = compression.limits()
+    zl.max_ratio = 0
+    row("zstd RLE bomb, 64 MiB limit, no ratio", kind_of(zstd.decompress_with(rle, zl)), "OK")
+    let mut zd = zstd.decoder(compression.limit_output(2000000))
+    let mut zout: List[u8] = List.new()
+    let zr = zd.feed(rle, inout zout)
+    print("zstd output held when the limit hit: {zout.len() <= 2000000}, {zr.is_err()}")
+    // the declared window is refused before any output
+    let mut small = compression.limits()
+    small.max_window = 1024
+    row("zstd window over max_window", kind_of(zstd.decompress_with(vectors.v("zst3_text"), small)), "TooLarge")
+}

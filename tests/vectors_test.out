@@ -1,0 +1,20 @@
+raw deflate: 42 vectors, 0 failures
+zlib and gzip: 12 vectors, 0 failures
+zstd: 18 vectors, 0 failures
+ok   deflate 40000 bytes
+ok   zst3_big
+ok   zst19_big
+ok   gzip with a name
+name hello.txt comment a comment extra 5859040061626364 mtime 1700000000 os 3
+ok   gzip with every header field and a header CRC
+ok   gzip with a header CRC
+ok   two gzip members
+ok   zero padding after a member
+single member, second member: Trailing at 40
+ok   zlib_level1
+ok   zlib_level9
+zlib stream with a preset dictionary, none given: Dictionary
+ok   zlib stream with a preset dictionary
+zlib stream, wrong dictionary: Dictionary
+ok   two zstd frames
+ok   a skippable frame, then a frame

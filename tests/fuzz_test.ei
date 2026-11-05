@@ -1,0 +1,81 @@
+// A deterministic fuzzer (the same LCG every run): valid streams with a few random edits, and
+// random bytes behind a valid header, fed to every decoder with a small output limit. The only
+// question is whether anything traps; the answer is printed per format.
+
+import compression
+import compression.codec as codec
+import compression.tests.vectors as vectors
+import compression.tests.util as util
+
+fn mutate(src: List[u8], inout g: util.Rng) -> List[u8] {
+    let mut m = src.copy()
+    let edits = (util.next(inout g) % 4) + 1
+    let mut k: u64 = 0
+    while k < edits {
+        let kind = util.next(inout g) % 5
+        if m.len() == 0 { return m }
+        let i = (util.next(inout g) as usize) % m.len()
+        if kind == 0 {
+            m[i] = (util.next(inout g) & 255) as u8
+        } else if kind == 1 {
+            m[i] = m[i] ^ (1 << (util.next(inout g) % 8)) as u8
+        } else if kind == 2 {
+            m.remove(i)
+        } else if kind == 3 {
+            m.insert(i, (util.next(inout g) & 255) as u8)
+        } else {
+            m.truncate(i + 1)
+        }
+        k += 1
+    }
+    m
+}
+
+fn run(name: str, f: codec.Format, seeds: List[String], iters: i32) uses io {
+    let mut g = util.rng(12345)
+    let mut errs = 0
+    let mut oks = 0
+    let lim = compression.limit_output(3000000)
+    let mut i = 0
+    while i < iters {
+        let s = vectors.vs(seeds[(util.next(inout g) as usize) % seeds.len()].copy())
+        let m = mutate(s, inout g)
+        // sometimes in pieces, to exercise the resumable paths
+        if i % 2 == 0 {
+            match codec.decode(f, m, lim) {
+                Ok(_) => { oks += 1 }
+                Err(_) => { errs += 1 }
+            }
+        } else {
+            let mut d = codec.decoder(f, lim)
+            let mut out: List[u8] = List.new()
+            let mut p: usize = 0
+            let mut failed = false
+            while p < m.len() && !failed {
+                let step = ((util.next(inout g) % 40) as usize) + 1
+                let mut e = p + step
+                if e > m.len() { e = m.len() }
+                match d.feed(m.slice(p, e), inout out) {
+                    Ok(_) => {}
+                    Err(_) => { failed = true }
+                }
+                p = e
+            }
+            if failed { errs += 1 } else {
+                match d.finish() {
+                    Ok(_) => { oks += 1 }
+                    Err(_) => { errs += 1 }
+                }
+            }
+        }
+        i += 1
+    }
+    print("{name}: {iters} mutated streams survived")
+}
+
+fn main() uses io {
+    run("raw deflate", codec.Raw, List[String.from("raw6_text"), String.from("raw1_bytes"), String.from("fixed_text"), String.from("raw0_text"), String.from("huff_text"), String.from("rle_zeros")], 4000)
+    run("zlib", codec.Zlib, List[String.from("zlib6_text"), String.from("zlib6_hello")], 2000)
+    run("gzip", codec.Gzip, List[String.from("gz6_text"), String.from("gz_all"), String.from("gz_two")], 2000)
+    run("zstd", codec.Zstd, List[String.from("zst1_text"), String.from("zst3_text"), String.from("zst19_text"), String.from("zst3_big"), String.from("zst19_big"), String.from("zst1_bytes"), String.from("zst_two_frames")], 4000)
+}

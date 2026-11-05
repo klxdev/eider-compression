@@ -1,0 +1,221 @@
+// The streaming interfaces: decoders fed in chunks of every size, encoders fed in pieces with sync
+// flushes (what was flushed can be decoded from the output so far), codec's format choice, and the
+// std/stream adapters (a Reader that decodes, a Writer that encodes).
+
+import core.sys
+import std.stream
+import compression
+import compression.codec as codec
+import compression.streams as streams
+import compression.tests.util as util
+
+fn formats() -> List[codec.Format] {
+    List[codec.Gzip, codec.Zlib, codec.Raw, codec.Deflate, codec.Zstd]
+}
+
+fn fmt_name(f: codec.Format) -> String {
+    match f {
+        codec.Gzip => String.from("gzip")
+        codec.Zlib => String.from("zlib")
+        codec.Raw => String.from("raw deflate")
+        codec.Deflate => String.from("deflate")
+        codec.Zstd => String.from("zstd")
+        codec.Identity => String.from("identity")
+        codec.Auto => String.from("auto")
+    }
+}
+
+// decodes `comp` in pieces of `chunk` bytes
+fn decode_chunks(f: codec.Format, comp: List[u8], chunk: usize) -> Result[List[u8], compression.Error] {
+    let mut d = codec.decoder(f, compression.limits())
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < comp.len() {
+        let mut e = i + chunk
+        if e > comp.len() { e = comp.len() }
+        d.feed(comp.slice(i, e), inout out)?
+        i = e
+    }
+    d.finish()?
+    Ok(out)
+}
+
+fn main() uses io {
+    let data = util.mixed(30000, 3)
+    // chunked decoding, every format, chunk sizes from one byte up
+    for f in formats() {
+        let enc = f.copy()
+        let comp = codec.encode(enc, data, 6)
+        let mut bad = 0
+        let mut n = 0
+        let chunks: List[usize] = List[1, 2, 3, 5, 7, 64, 1000, 4096, 100000]
+        for chunk in chunks {
+            n += 1
+            util.expect("{fmt_name(f)} in chunks of {chunk}", decode_chunks(f, comp, chunk), data, inout bad)
+        }
+        print("{fmt_name(f)}: {n} chunk sizes, {bad} failures")
+    }
+    // auto-detection
+    let mut bad = 0
+    for f in List[codec.Gzip, codec.Zlib, codec.Raw, codec.Zstd] {
+        let comp = codec.encode(f, data, 6)
+        util.expect("auto {fmt_name(f)}", decode_chunks(codec.Auto, comp, 100), data, inout bad)
+        util.expect("auto {fmt_name(f)} byte by byte", decode_chunks(codec.Auto, comp, 1), data, inout bad)
+    }
+    print("auto-detection: {bad} failures")
+    // a deflate coding is zlib or raw
+    let zl = codec.encode(codec.Zlib, data, 6)
+    let rw = codec.encode(codec.Raw, data, 6)
+    util.expect(String.from("deflate coding, zlib"), decode_chunks(codec.Deflate, zl, 4096), data, inout bad)
+    util.expect(String.from("deflate coding, raw"), decode_chunks(codec.Deflate, rw, 4096), data, inout bad)
+    print("deflate coding, both framings: {bad} failures")
+    // identity
+    util.expect(String.from("identity"), decode_chunks(codec.Identity, data, 777), data, inout bad)
+
+    // truncated streams
+    for f in formats() {
+        let comp = codec.encode(f, data, 6)
+        let cut = comp.slice(0, comp.len() / 2)
+        match decode_chunks(f, cut, 1000) {
+            Ok(_) => print("FAIL {fmt_name(f)}: a half stream decoded")
+            Err(e) => print("{fmt_name(f)} cut in half: {e.kind}")
+        }
+        match decode_chunks(f, List.new(), 1000) {
+            Ok(_) => print("FAIL {fmt_name(f)}: empty input decoded")
+            Err(e) => print("{fmt_name(f)} empty: {e.kind}")
+        }
+    }
+
+    // streaming encoders: pieces and sync flushes; after each flush the output so far decodes to the input so far
+    for f in formats() {
+        let mut e = codec.encoder(f, 6)
+        let mut out: List[u8] = List.new()
+        let mut sent: List[u8] = List.new()
+        let mut i: usize = 0
+        let mut piece = 0
+        let mut flushes = 0
+        let mut ok = true
+        while i < data.len() {
+            let mut stop = i + 777
+            if stop > data.len() { stop = data.len() }
+            let p = data.slice(i, stop)
+            match e.write(p, inout out) {
+                Ok(_) => {}
+                Err(_) => { ok = false }
+            }
+            sent.extend(p)
+            i = stop
+            piece += 1
+            if piece % 5 == 0 {
+                match e.flush(inout out) {
+                    Ok(_) => {}
+                    Err(_) => { ok = false }
+                }
+                flushes += 1
+                // decode what has been produced so far, without finishing
+                let mut d = codec.decoder(f, compression.limits())
+                let mut got: List[u8] = List.new()
+                match d.feed(out.copy(), inout got) {
+                    Ok(_) => { if !util.same(got, sent) { ok = false } }
+                    Err(_) => { ok = false }
+                }
+            }
+        }
+        match e.finish(inout out) {
+            Ok(_) => {}
+            Err(_) => { ok = false }
+        }
+        let mut b2 = 0
+        util.expect("{fmt_name(f)} streamed", decode_chunks(f, out, 4096), data, inout b2)
+        print("{fmt_name(f)} streamed with {flushes} flushes: {ok && b2 == 0}")
+    }
+
+    // writing after finish is an error
+    let mut e = codec.encoder(codec.Gzip, 6)
+    let mut sink: List[u8] = List.new()
+    let r1 = e.finish(inout sink)
+    match e.write(sys.lit("x"), inout sink) {
+        Ok(_) => print("FAIL write after finish")
+        Err(x) => print("write after finish: {x.kind}")
+    }
+
+    // names
+    for n in List["gzip", "GZIP", "x-gzip", "deflate", "zstd", "identity", "br", "compress"] {
+        match codec.format_of(sys.lit(n)) {
+            Some(f) => print("{n} -> {fmt_name(f)} ({codec.name(f)})")
+            None => print("{n} -> none")
+        }
+    }
+
+    // std/stream adapters
+    let comp = codec.encode(codec.Gzip, data, 6)
+    let mut r = streams.decode_reader(stream.reader(comp), codec.Gzip, compression.limits())
+    match stream.read_all(inout r) {
+        Ok(o) => util.check("decode reader, read_all", util.same(o, data))
+        Err(x) => print("FAIL decode reader: {x}")
+    }
+    let mut r2 = streams.decode_reader(stream.reader(comp), codec.Gzip, compression.limits())
+    let mut got: List[u8] = List.new()
+    let mut reads = 0
+    let mut failed = false
+    while true {
+        match r2.read(100) {
+            Ok(piece) => {
+                if piece.len() == 0 { break }
+                got.extend(piece)
+                reads += 1
+            }
+            Err(x) => {
+                print("FAIL decode reader: {x}")
+                failed = true
+                break
+            }
+        }
+    }
+    util.check("decode reader, reads of at most 100 bytes", util.same(got, data) && !failed && reads >= 300)
+    let mut r3 = streams.decode_reader(stream.reader(comp.slice(0, 500)), codec.Gzip, compression.limits())
+    match stream.read_all(inout r3) {
+        Ok(_) => print("FAIL decode reader: truncated stream read")
+        Err(x) => print("decode reader, truncated stream: {x.kind}")
+    }
+    let mut bomb = streams.decode_reader(stream.reader(codec.encode(codec.Gzip, util.zeros(5000000), 6)), codec.Gzip, compression.limit_output(100000))
+    match stream.read_all(inout bomb) {
+        Ok(_) => print("FAIL decode reader: bomb read")
+        Err(x) => print("decode reader, bomb over the limit: {x.kind}")
+    }
+
+    let mut w = streams.encode_writer(stream.buffer(), codec.Gzip, 6)
+    let mut i: usize = 0
+    let mut wok = true
+    while i < data.len() {
+        let mut stop = i + 1000
+        if stop > data.len() { stop = data.len() }
+        match w.write(data.slice(i, stop)) {
+            Ok(_) => {}
+            Err(_) => { wok = false }
+        }
+        i = stop
+    }
+    match w.flush() {
+        Ok(_) => {}
+        Err(_) => { wok = false }
+    }
+    let mid = w.inner().bytes()
+    let mut dm = codec.decoder(codec.Gzip, compression.limits())
+    let mut gm: List[u8] = List.new()
+    match dm.feed(mid, inout gm) {
+        Ok(_) => util.check("encode writer, flushed output decodes", util.same(gm, data))
+        Err(x) => print("FAIL encode writer: {x}")
+    }
+    match w.close() {
+        Ok(_) => {}
+        Err(_) => { wok = false }
+    }
+    let mut b3 = 0
+    util.expect(String.from("encode writer"), decode_chunks(codec.Gzip, w.inner().bytes(), 4096), data, inout b3)
+    print("encode writer: {wok && b3 == 0}")
+    match w.write(sys.lit("more")) {
+        Ok(_) => print("FAIL encode writer: wrote after close")
+        Err(x) => print("encode writer after close: {x.kind}")
+    }
+}

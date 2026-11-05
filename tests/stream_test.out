@@ -1,0 +1,38 @@
+gzip: 9 chunk sizes, 0 failures
+zlib: 9 chunk sizes, 0 failures
+raw deflate: 9 chunk sizes, 0 failures
+deflate: 9 chunk sizes, 0 failures
+zstd: 9 chunk sizes, 0 failures
+auto-detection: 0 failures
+deflate coding, both framings: 0 failures
+gzip cut in half: Truncated
+gzip empty: Truncated
+zlib cut in half: Truncated
+zlib empty: Truncated
+raw deflate cut in half: Truncated
+raw deflate empty: Truncated
+deflate cut in half: Truncated
+deflate empty: Truncated
+zstd cut in half: Truncated
+zstd empty: Truncated
+gzip streamed with 7 flushes: true
+zlib streamed with 7 flushes: true
+raw deflate streamed with 7 flushes: true
+deflate streamed with 7 flushes: true
+zstd streamed with 7 flushes: true
+write after finish: Closed
+gzip -> gzip (gzip)
+GZIP -> gzip (gzip)
+x-gzip -> gzip (gzip)
+deflate -> deflate (deflate)
+zstd -> zstd (zstd)
+identity -> identity (identity)
+br -> none
+compress -> none
+ok   decode reader, read_all
+ok   decode reader, reads of at most 100 bytes
+decode reader, truncated stream: UnexpectedEof
+decode reader, bomb over the limit: InvalidData
+ok   encode writer, flushed output decodes
+encode writer: true
+encode writer after close: BrokenPipe

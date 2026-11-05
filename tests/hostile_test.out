@@ -1,0 +1,61 @@
+ok   block type 3: Corrupt
+ok   stored block, LEN and NLEN disagree: Corrupt
+ok   match before the start: Corrupt
+ok   length symbol 286: Corrupt
+ok   distance symbol 30: Corrupt
+ok   HLIT over 286: Corrupt
+ok   over-subscribed code length code: Corrupt
+ok   repeat with no previous length: Corrupt
+ok   byte after the final block: Trailing
+ok   nothing: Truncated
+ok   zlib header check: Corrupt
+ok   zlib method: Corrupt
+ok   zlib Adler-32: Checksum
+ok   zlib trailing byte: Trailing
+ok   zlib preset dictionary: Dictionary
+ok   gzip magic: Corrupt
+ok   gzip method: Unsupported
+ok   gzip reserved flags: Unsupported
+ok   gzip CRC-32: Checksum
+ok   gzip length: Checksum
+ok   gzip header CRC: Checksum
+ok   gzip garbage after the member: Trailing
+ok   gzip header over the limit: TooLarge
+ok   zstd magic: Corrupt
+ok   zstd content checksum: Checksum
+ok   zstd reserved header bit: Corrupt
+ok   zstd window over the limit: TooLarge
+ok   zstd declared size over the limit: TooLarge
+ok   zstd dictionary: Dictionary
+ok   zstd reserved block type: Corrupt
+ok   zstd block over 128 KiB: Corrupt
+ok   zstd header cut short: Truncated
+ok   zstd content size does not match: Corrupt
+ok   zstd bytes after the frame: Trailing
+raw6_text: 738 truncations, 0 decoded
+zlib6_text: 744 truncations, 0 decoded
+gz6_text: 756 truncations, 0 decoded
+zst1_text: 858 truncations, 0 decoded
+zst19_text: 709 truncations, 0 decoded
+raw6_text: 2214 altered streams, none trapped
+zlib6_text: 2232 altered streams, none decoded to wrong data: true
+gz6_text: 2268 altered streams, none decoded to wrong data: true
+zst1_text: 2574 altered streams, none decoded to wrong data: true
+zst19_text: 2127 altered streams, none decoded to wrong data: true
+a bomb of 4879 bytes, 5 MB when decoded
+ok   gzip bomb, default limits (64 MiB): OK
+ok   gzip bomb, 1 MB limit: TooLarge
+ok   deflate bomb, 1 MB limit: TooLarge
+ok   gzip bomb, ratio 100: RatioExceeded
+ok   deflate bomb, ratio 100: RatioExceeded
+ok   gzip bomb, no limits: OK
+output held when the limit hit: true
+error after the limit: TooLarge, and the decoder stays failed: true
+ok   300 members, limit under their total: TooLarge
+ok   300 members, within the limit: OK
+a zstd frame of 806 bytes, 25 MiB when decoded
+ok   zstd RLE bomb, default limits (ratio): RatioExceeded
+ok   zstd RLE bomb, 1 MB limit: TooLarge
+ok   zstd RLE bomb, 64 MiB limit, no ratio: OK
+zstd output held when the limit hit: true, true
+ok   zstd window over max_window: TooLarge

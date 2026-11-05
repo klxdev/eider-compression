@@ -1,0 +1,11 @@
+deflate, zlib, gzip: 2256 round trips, 0 failures
+zstd: 240 round trips, 0 failures
+deflate text: true
+deflate level 9 not larger than level 1: true
+deflate zeros: true
+deflate noise grows by less than 0.1%: true
+deflate level 0 is stored: true
+gzip text: true
+zstd zeros: true
+zstd text: true
+zstd noise grows by less than 0.1%: true

@@ -1,0 +1,31 @@
+// Encoders and decoders are plain values: tasks that each own one run in parallel and share
+// nothing. Four tasks compress and decompress their own data in every format at once (this is
+// the test scripts/test.sh also runs under ThreadSanitizer).
+
+import compression
+import compression.codec as codec
+import compression.tests.util as util
+
+fn work(seed: u64) -> i32 {
+    let data = util.mixed(60000, seed)
+    let mut bad: i32 = 0
+    for f in List[codec.Gzip, codec.Zlib, codec.Raw, codec.Zstd] {
+        let comp = codec.encode(f, data, 3)
+        match codec.decode(f, comp, compression.limits()) {
+            Ok(o) => { if !util.same(o, data) { bad += 1 } }
+            Err(_) => { bad += 1 }
+        }
+    }
+    bad
+}
+
+fn main() uses io, threads {
+    let mut tasks: List[Task[i32]] = List.new()
+    for w in 0..4 {
+        let seed = (w as u64) + 100
+        tasks.push(spawn(|| -> i32 { work(seed) }))
+    }
+    let mut total = 0
+    for t in tasks { total += t.join() }
+    print("4 tasks, 4 formats each, failures: {total}")
+}

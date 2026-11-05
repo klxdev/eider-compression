@@ -124,6 +124,99 @@ if zstd:
     add("zst19_big", zstd.compress(big, options={zstd.CompressionParameter.compression_level: 19, zstd.CompressionParameter.checksum_flag: 1}))
     add("raw6_big", raw_deflate(big, 6))
 
+
+# ---- hostile and malformed inputs, built by hand (bit level for deflate)
+class Bits:
+    def __init__(self):
+        self.v = 0
+        self.n = 0
+
+    def put(self, value, count):  # LSB first
+        self.v |= value << self.n
+        self.n += count
+
+    def huff(self, code, count):  # a Huffman code, MSB first
+        for i in range(count - 1, -1, -1):
+            self.put((code >> i) & 1, 1)
+
+    def bytes(self):
+        return self.v.to_bytes((self.n + 7) // 8, "little")
+
+
+def fixed_lit(b, sym):
+    if sym < 144:
+        b.huff(0x30 + sym, 8)
+    elif sym < 256:
+        b.huff(0x190 + sym - 144, 9)
+    elif sym < 280:
+        b.huff(sym - 256, 7)
+    else:
+        b.huff(0xC0 + sym - 280, 8)
+
+
+b = Bits(); b.put(1, 1); b.put(3, 2); add("bad_blocktype", b.bytes())
+add("bad_stored", bytes([1, 5, 0, 0xFB, 0xFF, 1, 2, 3, 4, 5]))
+b = Bits(); b.put(1, 1); b.put(1, 2); fixed_lit(b, ord("a")); fixed_lit(b, 257); b.huff(4, 5); fixed_lit(b, 256)
+add("bad_dist", b.bytes())
+b = Bits(); b.put(1, 1); b.put(1, 2); fixed_lit(b, 286); fixed_lit(b, 256)
+add("bad_sym286", b.bytes())
+b = Bits(); b.put(1, 1); b.put(1, 2); fixed_lit(b, ord("a")); fixed_lit(b, 257); b.huff(30, 5); fixed_lit(b, 256)
+add("bad_dist30", b.bytes())
+b = Bits(); b.put(1, 1); b.put(2, 2); b.put(31, 5); b.put(0, 5); b.put(0, 4)
+add("bad_hlit", b.bytes())
+# a dynamic block whose code length code is over-subscribed: HCLEN=4 lengths 1,1,1,1
+b = Bits(); b.put(1, 1); b.put(2, 2); b.put(0, 5); b.put(0, 5); b.put(0, 4)
+for l in (1, 1, 1, 1):
+    b.put(l, 3)
+add("bad_oversub", b.bytes())
+# a dynamic block whose first code length is "repeat the previous" (code 16)
+b = Bits(); b.put(1, 1); b.put(2, 2); b.put(0, 5); b.put(0, 5); b.put(0, 4)
+for l in (1, 0, 1, 0):  # order 16,17,18,0: 16 and 0 get 1-bit codes
+    b.put(l, 3)
+b.huff(0, 1); b.put(0, 2)  # symbol 16 (code 0), 3 repeats
+add("bad_repeat", b.bytes())
+
+good = zlib.compress(INPUTS["hello"], 6)
+add("bad_zlib_check", bytes([0x78, 0x9D]) + good[2:])
+add("bad_zlib_method", bytes([0x77, 0x01]) + good[2:])
+add("bad_zlib_adler", good[:-1] + bytes([good[-1] ^ 1]))
+add("bad_zlib_trailing", good + b"x")
+g = gz(INPUTS["hello"])
+add("bad_gz_magic", bytes([0x1F, 0x8C]) + g[2:])
+add("bad_gz_method", g[:2] + bytes([7]) + g[3:])
+add("bad_gz_flags", g[:3] + bytes([0xE0]) + g[4:])
+add("bad_gz_crc", g[:-8] + bytes([g[-8] ^ 1]) + g[-7:])
+add("bad_gz_size", g[:-1] + bytes([g[-1] ^ 1]))
+add("bad_gz_garbage", g + b"junk")
+hg = gz(INPUTS["hello"], hcrc=True)
+add("bad_gz_hcrc", hg[:10] + bytes([hg[10] ^ 1]) + hg[11:])
+
+if zstd:
+    z = zstd.compress(INPUTS["hello"], options={zstd.CompressionParameter.checksum_flag: 1})
+    add("bad_zst_magic", bytes([0x27]) + z[1:])
+    add("bad_zst_csum", z[:-1] + bytes([z[-1] ^ 1]))
+    add("bad_zst_reserved", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x08, 0x00]))
+    # window descriptor 0xFF: a 2 TiB window
+    add("bad_zst_window", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x00, 0xFF]))
+    # single segment with a declared content size of 1 TiB (8-byte size)
+    add("bad_zst_fcs", bytes([0x28, 0xB5, 0x2F, 0xFD, 0xE0]) + struct.pack("<Q", 1 << 40))
+    add("bad_zst_dict", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x01, 0x58, 0x07]))
+    # a reserved block type, and a block larger than 128 KiB
+    add("bad_zst_blocktype", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x58]) + struct.pack("<I", 1 | (3 << 1) | (0 << 3))[:3])
+    add("bad_zst_blocksize", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x58]) + struct.pack("<I", 1 | (0 << 1) | (200000 << 3))[:3])
+    # 200 RLE blocks of 128 KiB (25 MiB from 800 bytes), window 128 KiB
+    rle = b"".join(struct.pack("<I", (1 if i == 199 else 0) | (1 << 1) | (131072 << 3))[:3] + b"\x00" for i in range(200))
+    add("zst_rle_bomb", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x58]) + rle)
+    # a frame header cut short, and a frame with no blocks
+    add("bad_zst_short", bytes([0x28, 0xB5, 0x2F, 0xFD]))
+    # a frame that declares 10 bytes but holds 5
+    add("bad_zst_fcs_mismatch", bytes([0x28, 0xB5, 0x2F, 0xFD, 0x20, 10]) + struct.pack("<I", 1 | (0 << 1) | (5 << 3))[:3] + b"hello")
+
+# a bomb for deflate/gzip: 5 MB of zeros
+zb = bytes(5_000_000)
+add("zeros_gz", gz(zb, 9))
+add("zeros_raw", raw_deflate(zb, 9))
+
 print("//! Test vectors made by the reference implementations (scripts/gen-vectors.py): zlib's deflate,")
 print("//! zlib and gzip framing, and libzstd. Each is a hex string; `v(name)` decodes it.")
 print()

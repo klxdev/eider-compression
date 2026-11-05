@@ -1,0 +1,4 @@
+raw deflate: 4000 mutated streams survived
+zlib: 2000 mutated streams survived
+gzip: 2000 mutated streams survived
+zstd: 4000 mutated streams survived
