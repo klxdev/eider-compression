@@ -1,0 +1,1014 @@
+//! compression.zstd: Zstandard frames (RFC 8878).
+//!
+//! Decoding: `decompress(data)` decodes a whole buffer (one or more frames, skippable frames
+//! skipped); `Decoder` takes the input in chunks and appends the output to a List. All the
+//! block types are handled (raw, RLE, compressed with Huffman or raw literals, FSE sequences
+//! with predefined, RLE, FSE-coded or repeated tables), repeat offsets, 1 or 4 Huffman streams,
+//! treeless literals and the XXH64 content checksum. Dictionaries are not supported: a frame
+//! that names one is refused with a `Dictionary` error.
+//!
+//! Hostile input never traps: every problem is an `Err(compression.Error)`. A frame cannot make
+//! the decoder allocate more than `Limits.max_window` of history plus one 128 KiB block, a
+//! declared content size over `max_output` is refused before any output, and `max_output` and
+//! `max_ratio` are checked before each literal run and match is copied.
+
+import compression
+import compression.checksum as ck
+
+// ---- tables
+
+fn ll_base() -> List[u32] {
+    List[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+}
+
+fn ll_bits() -> List[u32] {
+    List[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+}
+
+fn ml_base() -> List[u32] {
+    List[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387, 32771, 65539]
+}
+
+fn ml_bits() -> List[u32] {
+    List[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+}
+
+fn ll_default() -> List[i32] {
+    List[4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1]
+}
+
+fn ml_default() -> List[i32] {
+    List[1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1]
+}
+
+fn of_default() -> List[i32] {
+    List[1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1]
+}
+
+fn highbit(x: u32) -> u32 {
+    let mut n: u32 = 0
+    let mut v = x.copy()
+    while v > 1 {
+        v = v >> 1
+        n += 1
+    }
+    n
+}
+
+// ---- FSE
+
+/// An FSE decoding table: for state `s` the symbol, the number of bits to read and the base
+/// of the next state.
+pub type Fse = { sym: List[u8], nb: List[u8], base: List[u32], log: u32 }
+
+fn fse_empty() -> Fse { Fse(List.new(), List.new(), List.new(), 0) }
+
+/// The table for the normalized counts `norm[0 .. n]` (-1 marks a "less than one" symbol) with
+/// accuracy `log`; None if the counts are not a valid distribution.
+fn fse_build(norm: List[i32], n: usize, log: u32) -> Option[Fse] {
+    let size: usize = 1 << (log as usize)
+    let mut sym: List[u8] = List.filled(0, size)
+    let mut nb: List[u8] = List.filled(0, size)
+    let mut base: List[u32] = List.filled(0, size)
+    let mut next: List[u32] = List.filled(0, n)
+    let mut high: i32 = (size as i32) - 1
+    let mut total: i32 = 0
+    for s in 0..n {
+        let c = norm[s].copy()
+        if c == -1 {
+            sym[high as usize] = s as u8
+            high -= 1
+            next[s] = 1
+            total += 1
+        } else if c >= 0 {
+            next[s] = c as u32
+            total += c
+        } else {
+            return None
+        }
+    }
+    if total != (size as i32) { return None }
+    let step = (size >> 1) + (size >> 3) + 3
+    let mask = size - 1
+    let mut pos: usize = 0
+    for s in 0..n {
+        let c = norm[s].copy()
+        if c > 0 {
+            let mut i: i32 = 0
+            while i < c {
+                sym[pos] = s as u8
+                pos = (pos + step) & mask
+                while (pos as i32) > high { pos = (pos + step) & mask }
+                i += 1
+            }
+        }
+    }
+    if pos != 0 { return None }
+    for u in 0..size {
+        let s = sym[u] as usize
+        let ns = next[s].copy()
+        next[s] += 1
+        let bits = log - highbit(ns)
+        nb[u] = bits as u8
+        base[u] = (ns << bits) - (size as u32)
+    }
+    Some(Fse(sym, nb, base, log))
+}
+
+/// A table with one symbol, read with no bits (zstd's RLE mode).
+fn fse_rle(s: u8) -> Fse { Fse(List[s], List[0], List[0], 0) }
+
+fn lsb_bits(b: List[u8], bit: usize, n: u32, stop: usize) -> u32 {
+    // n <= 16 bits at bit position `bit`, bytes at or after `stop` read as zero
+    let i = bit >> 3
+    let mut v: u32 = 0
+    let mut k: usize = 0
+    while k < 4 {
+        if i + k < stop { v = v | ((b[i + k] as u32) << ((k * 8) as u32)) }
+        k += 1
+    }
+    (v >> ((bit & 7) as u32)) & ((1 << n) - 1)
+}
+
+/// Reads an FSE table description from `b[from .. to]`: (counts, symbols, accuracy log, bytes
+/// used), or a message.
+fn fse_read(b: List[u8], from: usize, to: usize, max_log: u32, max_sym: usize) -> Result[(List[i32], usize, u32, usize), String] {
+    if from >= to { return Err(String.from("empty FSE table description")) }
+    let mut bp: usize = from * 8
+    let stop = to.copy()
+    let log = lsb_bits(b, bp, 4, stop) + 5
+    bp += 4
+    if log > max_log { return Err(String.from("FSE accuracy log too large")) }
+    let mut remaining: i32 = (1 << (log as i32)) + 1
+    let mut threshold: i32 = 1 << (log as i32)
+    let mut nbbits: u32 = log + 1
+    let mut norm: List[i32] = List.new()
+    let mut prev0 = false
+    while remaining > 1 {
+        if prev0 {
+            let mut more = true
+            while more {
+                let r = lsb_bits(b, bp, 2, stop)
+                bp += 2
+                let mut k: u32 = 0
+                while k < r {
+                    norm.push(0)
+                    k += 1
+                }
+                if r != 3 { more = false }
+                if norm.len() > max_sym + 1 { return Err(String.from("FSE table has too many symbols")) }
+            }
+        }
+        let mx = (2 * threshold - 1) - remaining
+        let v = lsb_bits(b, bp, nbbits, stop) as i32
+        let mut count: i32 = 0
+        if (v & (threshold - 1)) < mx {
+            count = v & (threshold - 1)
+            bp += (nbbits - 1) as usize
+        } else {
+            count = v & (2 * threshold - 1)
+            if count >= threshold { count -= mx }
+            bp += nbbits as usize
+        }
+        count -= 1
+        let mag = if count < 0 { -count } else { count }
+        remaining -= mag
+        norm.push(count)
+        prev0 = count == 0
+        if norm.len() > max_sym + 1 { return Err(String.from("FSE table has too many symbols")) }
+        while remaining < threshold {
+            nbbits -= 1
+            threshold = threshold >> 1
+        }
+        if bp > stop * 8 { return Err(String.from("FSE table description is cut short")) }
+    }
+    if remaining != 1 { return Err(String.from("FSE counts do not add up")) }
+    let used = (bp + 7) / 8 - from
+    if from + used > to { return Err(String.from("FSE table description is cut short")) }
+    let n = norm.len()
+    Ok((norm, n, log, used))
+}
+
+// ---- a bit stream read backwards (from the last byte, below its marker bit)
+
+pub type Bwd = { d: List[u8], p: usize, lo: usize, c: u64, n: u64, over: u64 }
+
+fn bwd_new(d: List[u8], lo: usize, hi: usize) -> Option[Bwd] {
+    if hi <= lo { return None }
+    let last = d[hi - 1].copy()
+    if last == 0 { return None }
+    let hb = highbit(last as u32) as u64
+    Some(Bwd(d, hi - 1, lo, (last as u64) & ((1 << hb) - 1), hb, 0))
+}
+
+impl Bwd {
+    fn fill(inout self) {
+        while self.n <= 56 && self.p > self.lo {
+            self.p -= 1
+            self.c = (self.c << 8) | (self.d[self.p] as u64)
+            self.n += 8
+        }
+    }
+
+    // `k` <= 32 bits, the earliest-read bit highest; reading past the start is counted in
+    // `over` and gives zeros
+    fn read(inout self, k: u64) -> u32 {
+        if k == 0 { return 0 }
+        if self.n < k { self.fill() }
+        if self.n >= k {
+            let v = ((self.c >> (self.n - k)) & ((1 << k) - 1)) as u32
+            self.n -= k
+            return v
+        }
+        self.over += k - self.n
+        let v = ((self.c << (k - self.n)) & ((1 << k) - 1)) as u32
+        self.n = 0
+        self.c = 0
+        v
+    }
+
+    fn peek(inout self, k: u64) -> u32 {
+        if self.n < k { self.fill() }
+        if self.n >= k { return ((self.c >> (self.n - k)) & ((1 << k) - 1)) as u32 }
+        ((self.c << (k - self.n)) & ((1 << k) - 1)) as u32
+    }
+
+    fn skip(inout self, k: u64) {
+        if self.n >= k {
+            self.n -= k
+        } else {
+            self.over += k - self.n
+            self.n = 0
+        }
+    }
+
+    /// Every bit was read and none was missing.
+    fn finished(self) -> bool { self.n == 0 && self.p == self.lo && self.over == 0 }
+}
+
+// ---- Huffman
+
+/// A Huffman decoding table indexed by the next `bits` bits.
+pub type Huf = { sym: List[u8], nb: List[u8], bits: u32 }
+
+fn huf_empty() -> Huf { Huf(List.new(), List.new(), 0) }
+
+// The description at b[from..to] (its length is what the literals header gave): (table, bytes used)
+fn huf_read(b: List[u8], from: usize, to: usize) -> Result[(Huf, usize), String] {
+    if from >= to { return Err(String.from("empty Huffman table description")) }
+    let hdr = b[from] as usize
+    let mut w: List[u8] = List.new()
+    let mut used: usize = 0
+    if hdr >= 128 {
+        let nw = hdr - 127
+        let nbytes = (nw + 1) / 2
+        if from + 1 + nbytes > to { return Err(String.from("Huffman weights are cut short")) }
+        let mut i: usize = 0
+        while i < nw {
+            let byte = b[from + 1 + i / 2]
+            w.push(if (i & 1) == 0 { byte >> 4 } else { byte & 15 })
+            i += 1
+        }
+        used = 1 + nbytes
+    } else {
+        if hdr == 0 { return Err(String.from("empty Huffman weights")) }
+        if from + 1 + hdr > to { return Err(String.from("Huffman weights are cut short")) }
+        let end = from + 1 + hdr
+        let (norm, n, log, hu) = fse_read(b, from + 1, end, 6, 255)?
+        let t = match fse_build(norm, n, log) {
+            Some(t) => t
+            None => { return Err(String.from("invalid FSE table for Huffman weights")) }
+        }
+        let mut br = match bwd_new(b, from + 1 + hu, end) {
+            Some(r) => r
+            None => { return Err(String.from("Huffman weights have no bit stream")) }
+        }
+        let mut s1 = br.read(log as u64) as usize
+        let mut s2 = br.read(log as u64) as usize
+        let mut done = false
+        while !done {
+            if w.len() >= 255 { return Err(String.from("too many Huffman weights")) }
+            w.push(t.sym[s1])
+            s1 = (t.base[s1] + br.read(t.nb[s1] as u64)) as usize
+            if br.over > 0 {
+                w.push(t.sym[s2])
+                done = true
+            } else {
+                if w.len() >= 255 { return Err(String.from("too many Huffman weights")) }
+                w.push(t.sym[s2])
+                s2 = (t.base[s2] + br.read(t.nb[s2] as u64)) as usize
+                if br.over > 0 {
+                    w.push(t.sym[s1])
+                    done = true
+                }
+            }
+        }
+        used = 1 + hdr
+    }
+    // the implied last weight
+    let mut total: u32 = 0
+    for x in w {
+        if x > 11 { return Err(String.from("Huffman weight too large")) }
+        if x > 0 { total += 1 << ((x - 1) as u32) }
+    }
+    if total == 0 { return Err(String.from("Huffman weights are all zero")) }
+    let bits = highbit(total) + 1
+    if bits > 11 { return Err(String.from("Huffman table too large")) }
+    let rest = (1 << bits) - total
+    if rest == 0 || (rest & (rest - 1)) != 0 { return Err(String.from("Huffman weights do not complete the code")) }
+    w.push((highbit(rest) + 1) as u8)
+    let size: usize = 1 << (bits as usize)
+    let mut sym: List[u8] = List.filled(0, size)
+    let mut nb: List[u8] = List.filled(0, size)
+    let mut pos: usize = 0
+    let mut wt: u8 = 1
+    while (wt as u32) <= bits {
+        for s in 0..w.len() {
+            if w[s] == wt {
+                let cnt: usize = 1 << ((wt - 1) as usize)
+                let nbits = (bits + 1 - (wt as u32)) as u8
+                let mut k: usize = 0
+                while k < cnt {
+                    sym[pos + k] = s as u8
+                    nb[pos + k] = nbits
+                    k += 1
+                }
+                pos += cnt
+            }
+        }
+        wt += 1
+    }
+    Ok((Huf(sym, nb, bits), used))
+}
+
+// decodes `count` symbols of one stream b[lo..hi] into `out`; false if the stream is malformed
+fn huf_stream(t: Huf, b: List[u8], lo: usize, hi: usize, count: usize, inout out: List[u8]) -> bool {
+    let mut br = match bwd_new(b, lo, hi) {
+        Some(r) => r
+        None => { return false }
+    }
+    let bits = t.bits as u64
+    let mut i: usize = 0
+    while i < count {
+        let v = br.peek(bits) as usize
+        out.push(t.sym[v])
+        br.skip(t.nb[v] as u64)
+        i += 1
+    }
+    br.finished()
+}
+
+// ---- the decoder
+
+const P_MAGIC: u32 = 0
+const P_FHEAD: u32 = 1
+const P_BHEAD: u32 = 2
+const P_BODY: u32 = 3
+const P_CSUM: u32 = 4
+const P_SKIP: u32 = 5
+const P_SKIPHEAD: u32 = 6
+const P_FAILED: u32 = 7
+
+const BLOCK_MAX: usize = 131072
+
+/// A streaming zstd decoder. Make one with `decoder(limits)`.
+pub type Decoder = {
+    lim: compression.Limits, buf: List[u8], bpos: usize, phase: u32, fed: u64,
+    window: u64, has_fcs: bool, fcs: u64, has_csum: bool, csum: ck.Xxh64, frame_out: u64,
+    btype: u32, bsize: usize, blast: bool, frames: u64, skip_left: u64,
+    hist: List[u8], flushed: usize, out_total: u64, fstart: usize,
+    rep1: usize, rep2: usize, rep3: usize,
+    have_huf: bool, huf: Huf, have_ll: bool, ll: Fse, have_of: bool, of: Fse, have_ml: bool, ml: Fse,
+    llb: List[u32], llx: List[u32], mlb: List[u32], mlx: List[u32],
+    err: Option[compression.Error],
+}
+
+pub fn decoder(lim: compression.Limits) -> Decoder {
+    Decoder(lim, List.new(), 0, P_MAGIC, 0, 0, false, 0, false, ck.xxh64_new(), 0,
+            0, 0, false, 0, 0, List.new(), 0, 0, 0, 1, 4, 8,
+            false, huf_empty(), false, fse_empty(), false, fse_empty(), false, fse_empty(),
+            ll_base(), ll_bits(), ml_base(), ml_bits(), None)
+}
+
+fn fail(inout d: Decoder, kind: compression.Kind, msg: str) -> compression.Error {
+    d.phase = P_FAILED
+    let e = compression.error(kind, msg, d.offset())
+    d.err = Some(e.copy())
+    e
+}
+
+fn le(b: List[u8], i: usize, n: usize) -> u64 {
+    let mut v: u64 = 0
+    let mut k: usize = 0
+    while k < n {
+        v = v | ((b[i + k] as u64) << ((k * 8) as u64))
+        k += 1
+    }
+    v
+}
+
+impl Decoder {
+    /// Input offset the decoder is at.
+    fn offset(self) -> u64 { self.fed - ((self.buf.len() - self.bpos) as u64) }
+
+    /// Bytes decoded so far (over all frames).
+    fn produced(self) -> u64 { self.out_total + ((self.hist.len() - self.flushed) as u64) }
+
+    /// Frames read completely so far.
+    fn frames(self) -> u64 { self.frames }
+
+    /// At least one frame was read completely and none is half read.
+    fn done(self) -> bool { self.phase == P_MAGIC && self.frames > 0 && self.buf.len() == self.bpos }
+
+    fn failed(self) -> compression.Error {
+        match self.err {
+            Some(e) => e.copy()
+            None => compression.error(compression.Closed, "zstd: decoder already failed", self.fed)
+        }
+    }
+
+    fn avail(self) -> usize { self.buf.len() - self.bpos }
+
+    /// Adds a chunk of input and appends what it decodes to `out`. After an `Err` the decoder
+    /// is finished (later calls return the same error).
+    fn feed(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.phase == P_FAILED { return Err(self.failed()) }
+        if self.phase == P_SKIP && self.skip_left > 0 {
+            // skippable frame bodies are not buffered
+            let n = data.len() as u64
+            self.fed += n
+            if n <= self.skip_left {
+                self.skip_left -= n
+                if self.skip_left == 0 { self.phase = P_MAGIC }
+                return Ok(())
+            }
+            let rest = data.slice(self.skip_left as usize, data.len())
+            self.skip_left = 0
+            self.phase = P_MAGIC
+            self.fed -= rest.len() as u64
+            return self.feed(rest, inout out)
+        }
+        if self.bpos >= self.buf.len() {
+            self.buf = data.copy()
+            self.bpos = 0
+        } else if data.len() > 0 {
+            if self.bpos > 0 {
+                self.buf.remove_range(0, self.bpos)
+                self.bpos = 0
+            }
+            self.buf.extend(data)
+        }
+        self.fed += data.len() as u64
+        let r = self.run()
+        self.flush_into(inout out)
+        r
+    }
+
+    fn flush_into(inout self, inout out: List[u8]) {
+        let n = self.hist.len()
+        let mut i = self.flushed.copy()
+        while i < n {
+            out.push(self.hist[i])
+            i += 1
+        }
+        self.out_total += (n - self.flushed) as u64
+        self.flushed = n
+        let keep = self.window as usize
+        if n > 2 * keep + BLOCK_MAX {
+            let cut = n - keep
+            self.hist.remove_range(0, cut)
+            self.flushed = keep
+            self.fstart = if self.fstart > cut { self.fstart - cut } else { 0 }
+        }
+    }
+
+    /// No more input: Ok if the last frame is complete (and there was one), else `Truncated`.
+    fn finish(inout self) -> Result[(), compression.Error] {
+        if self.phase == P_FAILED { return Err(self.failed()) }
+        if self.phase == P_MAGIC && self.frames > 0 && self.avail() == 0 { return Ok(()) }
+        Err(fail(inout self, compression.Truncated, "zstd: stream ends before the end of the frame"))
+    }
+
+    fn run(inout self) -> Result[(), compression.Error] {
+        while true {
+            let ph = self.phase.copy()
+            if ph == P_MAGIC {
+                if self.avail() == 0 { return Ok(()) }
+                if self.avail() < 4 {
+                    // not a frame start unless the bytes so far could be one
+                    return Ok(())
+                }
+                let m = le(self.buf, self.bpos, 4)
+                if m == 4247762216 {
+                    self.bpos += 4
+                    self.phase = P_FHEAD
+                } else if m >= 407710288 && m <= 407710303 {
+                    self.bpos += 4
+                    self.phase = P_SKIPHEAD
+                } else {
+                    self.bpos += 0
+                    if self.frames > 0 {
+                        return Err(fail(inout self, compression.Trailing, "zstd: data after the last frame"))
+                    }
+                    return Err(fail(inout self, compression.Corrupt, "zstd: bad magic number"))
+                }
+            } else if ph == P_SKIPHEAD {
+                if self.avail() < 4 { return Ok(()) }
+                self.skip_left = le(self.buf, self.bpos, 4)
+                self.bpos += 4
+                self.phase = P_SKIP
+            } else if ph == P_SKIP {
+                let have = self.avail() as u64
+                let take = if have < self.skip_left { have } else { self.skip_left.copy() }
+                self.bpos += take as usize
+                self.skip_left -= take
+                if self.skip_left > 0 { return Ok(()) }
+                self.frames += 1
+                self.phase = P_MAGIC
+            } else if ph == P_FHEAD {
+                if !self.frame_header()? { return Ok(()) }
+            } else if ph == P_BHEAD {
+                if self.avail() < 3 { return Ok(()) }
+                let h = le(self.buf, self.bpos, 3) as usize
+                self.blast = (h & 1) == 1
+                self.btype = ((h >> 1) & 3) as u32
+                self.bsize = h >> 3
+                if self.btype == 3 {
+                    return Err(fail(inout self, compression.Corrupt, "zstd: reserved block type"))
+                }
+                let win = if self.window < (BLOCK_MAX as u64) { self.window as usize } else { BLOCK_MAX }
+                if self.bsize > win {
+                    return Err(fail(inout self, compression.Corrupt, "zstd: block larger than the maximum block size"))
+                }
+                self.bpos += 3
+                self.phase = P_BODY
+            } else if ph == P_BODY {
+                let mut need = self.bsize.copy()
+                if self.btype == 1 { need = 1 }
+                if self.avail() < need { return Ok(()) }
+                self.block(need)?
+                self.bpos += need
+                if self.blast {
+                    self.phase = P_CSUM
+                } else {
+                    self.phase = P_BHEAD
+                }
+            } else if ph == P_CSUM {
+                if self.has_csum {
+                    if self.avail() < 4 { return Ok(()) }
+                    let want = le(self.buf, self.bpos, 4)
+                    if want != (self.csum.value() & 4294967295) {
+                        return Err(fail(inout self, compression.Checksum, "zstd: content checksum mismatch"))
+                    }
+                    self.bpos += 4
+                }
+                if self.has_fcs && self.fcs != self.frame_out {
+                    return Err(fail(inout self, compression.Corrupt, "zstd: frame content size does not match the data"))
+                }
+                self.frames += 1
+                self.phase = P_MAGIC
+            } else {
+                return Ok(())
+            }
+        }
+        Ok(())
+    }
+
+    // The frame header after the magic: Ok(true) when read, Ok(false) when more input is needed.
+    fn frame_header(inout self) -> Result[bool, compression.Error] {
+        if self.avail() < 1 { return Ok(false) }
+        let fd = self.buf[self.bpos] as u32
+        let fcs_flag = fd >> 6
+        let single = ((fd >> 5) & 1) == 1
+        if ((fd >> 3) & 1) == 1 {
+            return Err(fail(inout self, compression.Corrupt, "zstd: reserved frame header bit is set"))
+        }
+        let has_csum = ((fd >> 2) & 1) == 1
+        let dict_flag = fd & 3
+        let dict_len: usize = if dict_flag == 0 { 0 } else if dict_flag == 1 { 1 } else if dict_flag == 2 { 2 } else { 4 }
+        let fcs_len: usize = if fcs_flag == 0 { if single { 1 } else { 0 } } else if fcs_flag == 1 { 2 } else if fcs_flag == 2 { 4 } else { 8 }
+        let win_len: usize = if single { 0 } else { 1 }
+        let total = 1 + win_len + dict_len + fcs_len
+        if self.avail() < total { return Ok(false) }
+        let mut p = self.bpos + 1
+        let mut window: u64 = 0
+        if !single {
+            let wd = self.buf[p] as u64
+            p += 1
+            let exp = wd >> 3
+            let mant = wd & 7
+            let base: u64 = 1 << (10 + exp)
+            window = base + (base / 8) * mant
+        }
+        let dict_id = le(self.buf, p, dict_len)
+        p += dict_len
+        let mut fcs: u64 = 0
+        if fcs_len > 0 {
+            fcs = le(self.buf, p, fcs_len)
+            if fcs_len == 2 { fcs += 256 }
+        }
+        if single { window = fcs.copy() }
+        if dict_id != 0 {
+            return Err(fail(inout self, compression.Dictionary, "zstd: the frame needs a dictionary, which are not supported"))
+        }
+        if self.lim.max_window != 0 && window > self.lim.max_window {
+            return Err(fail(inout self, compression.TooLarge, "zstd: window size over the limit"))
+        }
+        if window > 4398046511104 {
+            return Err(fail(inout self, compression.Corrupt, "zstd: window size over the format's limit"))
+        }
+        let has_fcs = fcs_len > 0
+        if has_fcs && self.lim.max_output != 0 && fcs > self.lim.max_output {
+            return Err(fail(inout self, compression.TooLarge, "zstd: declared content size over the limit"))
+        }
+        self.bpos += total
+        self.fstart = self.hist.len()
+        self.window = window
+        self.has_fcs = has_fcs
+        self.fcs = fcs
+        self.has_csum = has_csum
+        self.csum = ck.xxh64_new()
+        self.frame_out = 0
+        self.rep1 = 1
+        self.rep2 = 4
+        self.rep3 = 8
+        self.have_huf = false
+        self.have_ll = false
+        self.have_of = false
+        self.have_ml = false
+        self.phase = P_BHEAD
+        Ok(true)
+    }
+
+    // Room left under the limits (output bytes that may still be produced).
+    fn room(self) -> u64 {
+        let cap = compression.output_cap(self.lim, self.fed)
+        let p = self.produced()
+        let mut r: u64 = if cap > p { cap - p } else { 0 }
+        if self.has_fcs {
+            let left = if self.fcs > self.frame_out { self.fcs - self.frame_out } else { 0 }
+            if left < r { r = left }
+        }
+        r
+    }
+
+    fn over(inout self, fcs: bool) -> compression.Error {
+        if fcs && self.has_fcs && self.frame_out >= self.fcs {
+            return fail(inout self, compression.Corrupt, "zstd: more data than the frame content size")
+        }
+        let e = compression.over_error(self.lim, self.fed, "zstd", self.offset())
+        self.phase = P_FAILED
+        self.err = Some(e.copy())
+        e
+    }
+
+    // Decodes the block whose `n` body bytes are at buf[bpos ..].
+    fn block(inout self, n: usize) -> Result[(), compression.Error] {
+        let start = self.hist.len()
+        if self.btype == 0 {
+            if (n as u64) > self.room() { return Err(self.over(true)) }
+            let mut i = self.bpos.copy()
+            let stop = i + n
+            while i < stop {
+                self.hist.push(self.buf[i])
+                i += 1
+            }
+        } else if self.btype == 1 {
+            let n_out = self.bsize.copy()
+            if (n_out as u64) > self.room() { return Err(self.over(true)) }
+            let v = self.buf[self.bpos].copy()
+            let mut i: usize = 0
+            while i < n_out {
+                self.hist.push(v)
+                i += 1
+            }
+        } else {
+            self.compressed(n)?
+        }
+        let made = self.hist.len() - start
+        self.frame_out += made as u64
+        if self.has_csum {
+            let h = self.hist.copy()
+            self.csum.update_range(h, start, h.len())
+        }
+        Ok(())
+    }
+
+    // A compressed block: literals, then sequences.
+    fn compressed(inout self, n: usize) -> Result[(), compression.Error] {
+        let b = self.buf.copy()
+        let lo = self.bpos.copy()
+        let hi = lo + n
+        if n < 2 { return Err(fail(inout self, compression.Corrupt, "zstd: compressed block too short")) }
+        // ---- literals section
+        let h0 = b[lo] as usize
+        let ltype = (h0 & 3) as u32
+        let sf = (h0 >> 2) & 3
+        let mut p = lo.copy()
+        let mut regen: usize = 0
+        let mut comp: usize = 0
+        let mut streams: usize = 1
+        if ltype <= 1 {
+            if sf == 0 || sf == 2 {
+                regen = h0 >> 3
+                p += 1
+            } else if sf == 1 {
+                if n < 2 { return Err(fail(inout self, compression.Corrupt, "zstd: literals header is cut short")) }
+                regen = (h0 >> 4) | ((b[lo + 1] as usize) << 4)
+                p += 2
+            } else {
+                if n < 3 { return Err(fail(inout self, compression.Corrupt, "zstd: literals header is cut short")) }
+                regen = (h0 >> 4) | ((b[lo + 1] as usize) << 4) | ((b[lo + 2] as usize) << 12)
+                p += 3
+            }
+        } else {
+            let hl: usize = if sf <= 1 { 3 } else if sf == 2 { 4 } else { 5 }
+            if n < hl { return Err(fail(inout self, compression.Corrupt, "zstd: literals header is cut short")) }
+            let v = le(b, lo, hl)
+            if sf == 0 {
+                regen = ((v >> 4) & 1023) as usize
+                comp = ((v >> 14) & 1023) as usize
+            } else if sf == 1 {
+                regen = ((v >> 4) & 1023) as usize
+                comp = ((v >> 14) & 1023) as usize
+                streams = 4
+            } else if sf == 2 {
+                regen = ((v >> 4) & 16383) as usize
+                comp = ((v >> 18) & 16383) as usize
+                streams = 4
+            } else {
+                regen = ((v >> 4) & 262143) as usize
+                comp = ((v >> 22) & 262143) as usize
+                streams = 4
+            }
+            p += hl
+        }
+        if regen > BLOCK_MAX { return Err(fail(inout self, compression.Corrupt, "zstd: literals larger than the maximum block size")) }
+        let mut lits: List[u8] = List.new()
+        if ltype == 0 {
+            if p + regen > hi { return Err(fail(inout self, compression.Corrupt, "zstd: raw literals are cut short")) }
+            lits = b.slice(p, p + regen)
+            p += regen
+        } else if ltype == 1 {
+            if p + 1 > hi { return Err(fail(inout self, compression.Corrupt, "zstd: RLE literal is missing")) }
+            lits = List.filled(b[p], regen)
+            p += 1
+        } else {
+            if p + comp > hi { return Err(fail(inout self, compression.Corrupt, "zstd: compressed literals are cut short")) }
+            let end = p + comp
+            let mut q = p.copy()
+            if ltype == 2 {
+                match huf_read(b, q, end) {
+                    Ok((t, used)) => {
+                        self.huf = t
+                        self.have_huf = true
+                        q += used
+                    }
+                    Err(m) => {
+                        let e = compression.Error(compression.Corrupt, m, self.offset())
+                        self.phase = P_FAILED
+                        self.err = Some(e.copy())
+                        return Err(e)
+                    }
+                }
+            } else if !self.have_huf {
+                return Err(fail(inout self, compression.Corrupt, "zstd: treeless literals without a previous table"))
+            }
+            let t = self.huf.copy()
+            if streams == 1 {
+                if !huf_stream(t, b, q, end, regen, inout lits) {
+                    return Err(fail(inout self, compression.Corrupt, "zstd: malformed Huffman literals stream"))
+                }
+            } else {
+                if q + 6 > end { return Err(fail(inout self, compression.Corrupt, "zstd: literal stream sizes are cut short")) }
+                let s1 = le(b, q, 2) as usize
+                let s2 = le(b, q + 2, 2) as usize
+                let s3 = le(b, q + 4, 2) as usize
+                q += 6
+                if q + s1 + s2 + s3 > end { return Err(fail(inout self, compression.Corrupt, "zstd: literal streams are cut short")) }
+                let seg = (regen + 3) / 4
+                if seg * 3 > regen { return Err(fail(inout self, compression.Corrupt, "zstd: literal streams do not add up")) }
+                let last = regen - seg * 3
+                let ok1 = huf_stream(t, b, q, q + s1, seg, inout lits)
+                let ok2 = huf_stream(t, b, q + s1, q + s1 + s2, seg, inout lits)
+                let ok3 = huf_stream(t, b, q + s1 + s2, q + s1 + s2 + s3, seg, inout lits)
+                let ok4 = huf_stream(t, b, q + s1 + s2 + s3, end, last, inout lits)
+                if !(ok1 && ok2 && ok3 && ok4) {
+                    return Err(fail(inout self, compression.Corrupt, "zstd: malformed Huffman literals stream"))
+                }
+            }
+            p = end
+        }
+        // ---- sequences section
+        if p >= hi { return Err(fail(inout self, compression.Corrupt, "zstd: sequences section is missing")) }
+        let b0 = b[p] as usize
+        p += 1
+        let mut nseq: usize = 0
+        if b0 == 0 {
+            nseq = 0
+        } else if b0 < 128 {
+            nseq = b0
+        } else if b0 < 255 {
+            if p >= hi { return Err(fail(inout self, compression.Corrupt, "zstd: sequence count is cut short")) }
+            nseq = ((b0 - 128) << 8) + (b[p] as usize)
+            p += 1
+        } else {
+            if p + 2 > hi { return Err(fail(inout self, compression.Corrupt, "zstd: sequence count is cut short")) }
+            nseq = (b[p] as usize) + ((b[p + 1] as usize) << 8) + 32512
+            p += 2
+        }
+        if nseq == 0 {
+            if p != hi { return Err(fail(inout self, compression.Corrupt, "zstd: data after the last sequence")) }
+            if (lits.len() as u64) > self.room() { return Err(self.over(true)) }
+            self.hist.extend(lits)
+            return Ok(())
+        }
+        if p >= hi { return Err(fail(inout self, compression.Corrupt, "zstd: sequence modes are missing")) }
+        let modes = b[p] as u32
+        p += 1
+        if (modes & 3) != 0 { return Err(fail(inout self, compression.Corrupt, "zstd: reserved sequence mode bits are set")) }
+        // the three tables, in order: literal lengths, offsets, match lengths
+        let mut kind = 0
+        while kind < 3 {
+            let mode = if kind == 0 { modes >> 6 } else if kind == 1 { (modes >> 4) & 3 } else { (modes >> 2) & 3 }
+            let max_log: u32 = if kind == 1 { 8 } else { 9 }
+            let max_sym: usize = if kind == 0 { 35 } else if kind == 1 { 31 } else { 52 }
+            let mut t = fse_empty()
+            let mut have = true
+            if mode == 0 {
+                let ok = if kind == 0 { fse_build(ll_default(), 36, 6) } else if kind == 1 { fse_build(of_default(), 29, 5) } else { fse_build(ml_default(), 53, 6) }
+                t = ok.unwrap()
+            } else if mode == 1 {
+                if p >= hi { return Err(fail(inout self, compression.Corrupt, "zstd: RLE sequence symbol is missing")) }
+                let s = b[p].copy()
+                if (s as usize) > max_sym { return Err(fail(inout self, compression.Corrupt, "zstd: RLE sequence symbol out of range")) }
+                p += 1
+                t = fse_rle(s)
+            } else if mode == 2 {
+                match fse_read(b, p, hi, max_log, max_sym) {
+                    Ok((norm, cnt, log, used)) => {
+                        match fse_build(norm, cnt, log) {
+                            Some(x) => { t = x }
+                            None => { return Err(fail(inout self, compression.Corrupt, "zstd: invalid FSE table for the sequences")) }
+                        }
+                        p += used
+                    }
+                    Err(m) => {
+                        let e = compression.Error(compression.Corrupt, m, self.offset())
+                        self.phase = P_FAILED
+                        self.err = Some(e.copy())
+                        return Err(e)
+                    }
+                }
+            } else {
+                if kind == 0 {
+                    if !self.have_ll { return Err(fail(inout self, compression.Corrupt, "zstd: repeated literal length table without a previous one")) }
+                    t = self.ll.copy()
+                } else if kind == 1 {
+                    if !self.have_of { return Err(fail(inout self, compression.Corrupt, "zstd: repeated offset table without a previous one")) }
+                    t = self.of.copy()
+                } else {
+                    if !self.have_ml { return Err(fail(inout self, compression.Corrupt, "zstd: repeated match length table without a previous one")) }
+                    t = self.ml.copy()
+                }
+                have = true
+            }
+            if mode != 3 {
+                if kind == 0 {
+                    self.ll = t
+                    self.have_ll = have
+                } else if kind == 1 {
+                    self.of = t
+                    self.have_of = have
+                } else {
+                    self.ml = t
+                    self.have_ml = have
+                }
+            }
+            kind += 1
+        }
+        self.sequences(b, p, hi, nseq, lits)
+    }
+
+    // Runs the `nseq` sequences coded in b[p..hi] over the literals `lits`.
+    fn sequences(inout self, b: List[u8], p: usize, hi: usize, nseq: usize, lits: List[u8]) -> Result[(), compression.Error] {
+        let mut br = match bwd_new(b, p, hi) {
+            Some(r) => r
+            None => { return Err(fail(inout self, compression.Corrupt, "zstd: the sequences have no bit stream")) }
+        }
+        let llt = self.ll.copy()
+        let oft = self.of.copy()
+        let mlt = self.ml.copy()
+        let mut sl = br.read(llt.log as u64) as usize
+        let mut so = br.read(oft.log as u64) as usize
+        let mut sm = br.read(mlt.log as u64) as usize
+        let mut room = self.room()
+        let mut rep1 = self.rep1.copy()
+        let mut rep2 = self.rep2.copy()
+        let mut rep3 = self.rep3.copy()
+        let mut lp: usize = 0
+        let nl = lits.len()
+        let mut made: usize = 0
+        // window available to matches: the history, bounded by the window size
+        let wmax = self.window
+        let mut i: usize = 0
+        while i < nseq {
+            let ofc = oft.sym[so] as u32
+            let mlc = mlt.sym[sm] as usize
+            let llc = llt.sym[sl] as usize
+            let ov = (1 << (ofc as u64)) + (br.read(ofc as u64) as u64)
+            let mlen = (self.mlb[mlc] as usize) + (br.read(self.mlx[mlc] as u64) as usize)
+            let llen = (self.llb[llc] as usize) + (br.read(self.llx[llc] as u64) as usize)
+            if br.over > 0 { return Err(fail(inout self, compression.Corrupt, "zstd: sequence bit stream is cut short")) }
+            if i + 1 < nseq {
+                sl = (llt.base[sl] + br.read(llt.nb[sl] as u64)) as usize
+                sm = (mlt.base[sm] + br.read(mlt.nb[sm] as u64)) as usize
+                so = (oft.base[so] + br.read(oft.nb[so] as u64)) as usize
+            }
+            // the offset, with the repeat codes
+            let mut offset: usize = 0
+            if ov > 3 {
+                offset = (ov - 3) as usize
+                rep3 = rep2.copy()
+                rep2 = rep1.copy()
+                rep1 = offset.copy()
+            } else {
+                let lz: usize = if llen == 0 { 1 } else { 0 }
+                let idx = (ov as usize) - 1 + lz
+                if idx == 0 {
+                    offset = rep1.copy()
+                } else if idx == 1 {
+                    offset = rep2.copy()
+                    rep2 = rep1.copy()
+                    rep1 = offset.copy()
+                } else if idx == 2 {
+                    offset = rep3.copy()
+                    rep3 = rep2.copy()
+                    rep2 = rep1.copy()
+                    rep1 = offset.copy()
+                } else {
+                    if rep1 <= 1 { return Err(fail(inout self, compression.Corrupt, "zstd: repeat offset of zero")) }
+                    offset = rep1 - 1
+                    rep3 = rep2.copy()
+                    rep2 = rep1.copy()
+                    rep1 = offset.copy()
+                }
+            }
+            // literals
+            if lp + llen > nl { return Err(fail(inout self, compression.Corrupt, "zstd: sequence uses more literals than the block has")) }
+            if (llen as u64) + (mlen as u64) > room { return Err(self.over(true)) }
+            room -= (llen as u64) + (mlen as u64)
+            let mut k: usize = 0
+            while k < llen {
+                self.hist.push(lits[lp + k])
+                k += 1
+            }
+            lp += llen
+            // the match
+            let have = self.hist.len()
+            if offset > have - self.fstart {
+                return Err(fail(inout self, compression.Corrupt, "zstd: match offset reaches before the start of the frame"))
+            }
+            if (offset as u64) > wmax {
+                return Err(fail(inout self, compression.Corrupt, "zstd: match offset over the window size"))
+            }
+            let src = have - offset
+            k = 0
+            while k < mlen {
+                self.hist.push(self.hist[src + k])
+                k += 1
+            }
+            made += llen + mlen
+            if made > BLOCK_MAX { return Err(fail(inout self, compression.Corrupt, "zstd: block regenerates more than the maximum block size")) }
+            i += 1
+        }
+        if !br.finished() { return Err(fail(inout self, compression.Corrupt, "zstd: sequence bit stream is not used up exactly")) }
+        // the literals after the last sequence
+        let left = nl - lp
+        if (left as u64) > room { return Err(self.over(true)) }
+        let mut k = lp.copy()
+        while k < nl {
+            self.hist.push(lits[k])
+            k += 1
+        }
+        made += left
+        if made > BLOCK_MAX { return Err(fail(inout self, compression.Corrupt, "zstd: block regenerates more than the maximum block size")) }
+        self.rep1 = rep1
+        self.rep2 = rep2
+        self.rep3 = rep3
+        Ok(())
+    }
+}
+
+/// Decodes zstd data (all frames) with the default limits.
+pub fn decompress(data: List[u8]) -> Result[List[u8], compression.Error] {
+    decompress_with(data, compression.limits())
+}
+
+pub fn decompress_with(data: List[u8], lim: compression.Limits) -> Result[List[u8], compression.Error] {
+    let mut d = decoder(lim)
+    let mut out: List[u8] = List.new()
+    d.feed(data, inout out)?
+    d.finish()?
+    Ok(out)
+}

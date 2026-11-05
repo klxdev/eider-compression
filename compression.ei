@@ -17,6 +17,8 @@
 //! are checked before the bytes are produced: a decoder never holds more than `max_output`
 //! bytes of one stream, whatever the input says.
 
+import std.checked
+
 /// What went wrong.
 pub type Kind =
     | Truncated
@@ -83,8 +85,31 @@ pub fn limit_output(max_output: u64) -> Limits {
     l
 }
 
-/// The size of the window deflate may refer back to.
-pub const DEFLATE_WINDOW: usize = 32768
+/// How much output a decoder may have produced after reading `fed` bytes of input: the
+/// smaller of `max_output` and the larger of `ratio_floor` and `max_ratio * fed` (a zero limit
+/// does not apply).
+pub fn output_cap(lim: Limits, fed: u64) -> u64 {
+    let mut cap: u64 = 18446744073709551615
+    if lim.max_output != 0 { cap = lim.max_output.copy() }
+    if lim.max_ratio != 0 {
+        let by_ratio = match fed.checked_mul(lim.max_ratio) {
+            Some(v) => if v < lim.ratio_floor { lim.ratio_floor.copy() } else { v }
+            None => 18446744073709551615
+        }
+        if by_ratio < cap { cap = by_ratio }
+    }
+    cap
+}
 
-/// The least a Decoder can promise about the ratio of deflate output to input.
-pub const DEFLATE_MAX_RATIO: u64 = 1032
+/// The error for output that passed `output_cap(lim, fed)`: `TooLarge` when `max_output` was
+/// the cap, `RatioExceeded` when the ratio was.
+pub fn over_error(lim: Limits, fed: u64, what: str, offset: u64) -> Error {
+    if lim.max_output != 0 && output_cap(lim, fed) == lim.max_output {
+        let mut m = String.from(what)
+        m.push_str(": output over the limit")
+        return Error(TooLarge, m, offset)
+    }
+    let mut m = String.from(what)
+    m.push_str(": output over the ratio limit")
+    Error(RatioExceeded, m, offset)
+}

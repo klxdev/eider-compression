@@ -1,0 +1,249 @@
+//! compression.zlib: the zlib framing (RFC 1950) around deflate: a two-byte header, the
+//! deflate stream and an Adler-32 of the uncompressed data.
+//!
+//! This is what HTTP calls `Content-Encoding: deflate` (RFC 9110 means zlib by it; a few servers
+//! send raw deflate, which `compression.codec` tells apart).
+//!
+//! `decompress(data)` and `compress(data, level)` work on whole buffers. `Decoder` and `Encoder`
+//! take chunks. A `Decoder` checks the header, the Adler-32 and that nothing follows the stream;
+//! a preset dictionary (FDICT) is used when `with_dictionary` was given, and refused with a
+//! `Dictionary` error otherwise.
+
+import compression
+import compression.checksum as ck
+import compression.deflate as deflate
+
+const PH_HEADER: u32 = 0
+const PH_BODY: u32 = 1
+const PH_TRAILER: u32 = 2
+const PH_DONE: u32 = 3
+const PH_FAILED: u32 = 4
+
+/// A streaming zlib decoder. Make one with `decoder(limits)`.
+pub type Decoder = {
+    lim: compression.Limits, inf: deflate.Inflater, phase: u32,
+    hdr: List[u8], trail: List[u8], adler: ck.Adler32, dict: Option[List[u8]],
+    fed: u64, err: Option[compression.Error],
+}
+
+pub fn decoder(lim: compression.Limits) -> Decoder {
+    Decoder(lim, deflate.inflater(lim), PH_HEADER, List.new(), List.new(), ck.adler32_new(), None, 0, None)
+}
+
+/// A decoder for streams that may use the preset dictionary `dict`.
+pub fn decoder_with_dictionary(lim: compression.Limits, dict: List[u8]) -> Decoder {
+    let mut d = decoder(lim)
+    d.dict = Some(dict.copy())
+    d
+}
+
+fn fail(inout d: Decoder, kind: compression.Kind, msg: str) -> compression.Error {
+    d.phase = PH_FAILED
+    let e = compression.error(kind, msg, d.fed)
+    d.err = Some(e.copy())
+    e
+}
+
+impl Decoder {
+    /// The stream ended correctly (header, deflate data, Adler-32).
+    fn done(self) -> bool { self.phase == PH_DONE }
+
+    /// Bytes decoded so far.
+    fn produced(self) -> u64 { self.inf.produced() }
+
+    /// Adds a chunk of input and appends what it decodes to `out`. After an `Err` the decoder is
+    /// finished (later calls return `Closed`).
+    fn feed(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.phase == PH_FAILED {
+            return match self.err {
+                Some(e) => Err(e.copy())
+                None => Err(compression.error(compression.Closed, "zlib: decoder already failed", self.fed))
+            }
+        }
+        let mut i: usize = 0
+        let n = data.len()
+        let before = self.fed.copy()
+        // everything of `data` is accounted for by the end; `fed` moves as bytes are taken
+        if self.phase == PH_HEADER {
+            while i < n && !self.header_complete() {
+                self.hdr.push(data[i])
+                i += 1
+            }
+            self.fed = before + (i as u64)
+            if self.header_complete() {
+                self.read_header()?
+                self.phase = PH_BODY
+            }
+        }
+        if self.phase == PH_BODY && i < n {
+            let chunk = if i == 0 { data.copy() } else { data.slice(i, n) }
+            let start = out.len()
+            let r = self.inf.feed(chunk, inout out)
+            self.adler.update_range(out, start, out.len())
+            match r {
+                Ok(_) => {}
+                Err(e) => {
+                    self.phase = PH_FAILED
+                    let at = compression.Error(e.kind, e.message.copy(), e.offset + (self.hdr.len() as u64))
+                    self.err = Some(at.copy())
+                    return Err(at)
+                }
+            }
+            if self.inf.done() {
+                let used = self.inf.consumed() - (self.fed - before - (i as u64))
+                self.fed = before + (n as u64)
+                self.phase = PH_TRAILER
+                let rest = self.inf.rest()
+                self.take_trailer(rest)?
+            } else {
+                self.fed = before + (n as u64)
+            }
+        } else if self.phase == PH_TRAILER && i < n {
+            self.fed = before + (n as u64)
+            self.take_trailer(data.slice(i, n))?
+        } else if self.phase == PH_DONE && i < n {
+            self.fed = before + (n as u64)
+            return Err(fail(inout self, compression.Trailing, "zlib: data after the end of the stream"))
+        } else {
+            self.fed = before + (n as u64)
+        }
+        Ok(())
+    }
+
+    fn header_complete(self) -> bool {
+        if self.hdr.len() < 2 { return false }
+        if (self.hdr[1] & 32) != 0 { return self.hdr.len() >= 6 }
+        true
+    }
+
+    fn read_header(inout self) -> Result[(), compression.Error] {
+        let cmf = self.hdr[0] as u32
+        let flg = self.hdr[1] as u32
+        if (cmf & 15) != 8 { return Err(fail(inout self, compression.Corrupt, "zlib: not deflate (compression method is not 8)")) }
+        if (cmf >> 4) > 7 { return Err(fail(inout self, compression.Corrupt, "zlib: window size over 32 KiB")) }
+        if ((cmf << 8) | flg) % 31 != 0 { return Err(fail(inout self, compression.Corrupt, "zlib: header check failed")) }
+        if (flg & 32) != 0 {
+            let id = ((self.hdr[2] as u32) << 24) | ((self.hdr[3] as u32) << 16) | ((self.hdr[4] as u32) << 8) | (self.hdr[5] as u32)
+            match self.dict.copy() {
+                Some(d) => {
+                    if ck.adler32(d) != id {
+                        return Err(fail(inout self, compression.Dictionary, "zlib: the preset dictionary is not the one the stream uses"))
+                    }
+                    self.inf.set_dictionary(d)
+                }
+                None => {
+                    return Err(fail(inout self, compression.Dictionary, "zlib: the stream needs a preset dictionary"))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take_trailer(inout self, rest: List[u8]) -> Result[(), compression.Error] {
+        let mut i: usize = 0
+        while i < rest.len() && self.trail.len() < 4 {
+            self.trail.push(rest[i])
+            i += 1
+        }
+        if self.trail.len() == 4 {
+            let want = ((self.trail[0] as u32) << 24) | ((self.trail[1] as u32) << 16) | ((self.trail[2] as u32) << 8) | (self.trail[3] as u32)
+            if want != self.adler.value() {
+                return Err(fail(inout self, compression.Checksum, "zlib: Adler-32 mismatch"))
+            }
+            self.phase = PH_DONE
+            if i < rest.len() {
+                return Err(fail(inout self, compression.Trailing, "zlib: data after the end of the stream"))
+            }
+        }
+        Ok(())
+    }
+
+    /// No more input: Ok if the stream was complete, `Truncated` if not.
+    fn finish(inout self) -> Result[(), compression.Error] {
+        if self.phase == PH_FAILED {
+            return match self.err {
+                Some(e) => Err(e.copy())
+                None => Err(compression.error(compression.Closed, "zlib: decoder already failed", self.fed))
+            }
+        }
+        if self.phase == PH_DONE { return Ok(()) }
+        Err(fail(inout self, compression.Truncated, "zlib: stream ends before its end"))
+    }
+}
+
+/// Decodes a whole zlib stream with the default limits.
+pub fn decompress(data: List[u8]) -> Result[List[u8], compression.Error] {
+    decompress_with(data, compression.limits())
+}
+
+pub fn decompress_with(data: List[u8], lim: compression.Limits) -> Result[List[u8], compression.Error] {
+    let mut d = decoder(lim)
+    let mut out: List[u8] = List.new()
+    d.feed(data, inout out)?
+    d.finish()?
+    Ok(out)
+}
+
+/// A streaming zlib encoder. Make one with `encoder(level)`.
+pub type Encoder = { def: deflate.Deflater, adler: ck.Adler32, started: bool, level: i32 }
+
+pub fn encoder(level: i32) -> Encoder {
+    Encoder(deflate.deflater(level), ck.adler32_new(), false, level)
+}
+
+impl Encoder {
+    fn header(inout self, inout out: List[u8]) {
+        if self.started { return }
+        self.started = true
+        // CMF: deflate, 32 KiB window. FLG: the level hint, then the check bits.
+        let lv = self.def.level.copy()
+        let flevel: u32 = if lv < 2 { 0 } else if lv < 6 { 1 } else if lv == 6 { 2 } else { 3 }
+        let cmf: u32 = 120
+        let mut flg: u32 = flevel << 6
+        flg += 31 - (((cmf << 8) | flg) % 31)
+        out.push(cmf as u8)
+        out.push(flg as u8)
+    }
+
+    /// Compresses `data`; appends what is ready to `out`.
+    fn write(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        self.header(inout out)
+        self.adler.update(data)
+        self.def.write(data, inout out)
+    }
+
+    /// A sync flush (see `deflate.Deflater.flush`).
+    fn flush(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        self.header(inout out)
+        self.def.flush(inout out)
+    }
+
+    /// Ends the stream: the last block and the Adler-32.
+    fn finish(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        self.header(inout out)
+        self.def.finish(inout out)?
+        let a = self.adler.value()
+        out.push((a >> 24) as u8)
+        out.push(((a >> 16) & 255) as u8)
+        out.push(((a >> 8) & 255) as u8)
+        out.push((a & 255) as u8)
+        Ok(())
+    }
+
+    fn finished(self) -> bool { self.def.finished() }
+}
+
+/// Compresses `data` to a zlib stream; `level` is 0 to 9 (6 is the default, -1 means it).
+pub fn compress(data: List[u8], level: i32) -> List[u8] {
+    let mut e = encoder(level)
+    let mut out: List[u8] = List.new()
+    match e.write(data, inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match e.finish(inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    out
+}

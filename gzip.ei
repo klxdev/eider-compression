@@ -1,0 +1,399 @@
+//! compression.gzip: the gzip file format (RFC 1952): a header (optionally with a file name, a
+//! comment, an extra field and a header CRC), a deflate stream, and a CRC-32 and the length of the
+//! uncompressed data.
+//!
+//! `decompress(data)` and `compress(data, level)` work on whole buffers. `Decoder` and `Encoder`
+//! take chunks. A `Decoder` reads concatenated members (as gzip(1) does; `single_member()`
+//! stops after the first and treats more input as `Trailing`), checks each member's CRC-32 and
+//! length, and enforces the limits over the whole input, not per member. Zero bytes after the
+//! last member are ignored (tape padding), as gzip(1) does.
+
+import compression
+import compression.checksum as ck
+import compression.deflate as deflate
+
+const PH_HEADER: u32 = 0
+const PH_BODY: u32 = 1
+const PH_TRAILER: u32 = 2
+const PH_BETWEEN: u32 = 3
+const PH_FAILED: u32 = 4
+
+/// What a member's header said.
+pub type Header = {
+    mtime: u32, os: u8, text: bool, xfl: u8,
+    name: List[u8], comment: List[u8], extra: List[u8],
+}
+
+fn empty_header() -> Header { Header(0, 255, false, 0, List.new(), List.new(), List.new()) }
+
+// header parsing phases
+const H_FIXED: u32 = 0
+const H_XLEN: u32 = 1
+const H_EXTRA: u32 = 2
+const H_NAME: u32 = 3
+const H_COMMENT: u32 = 4
+const H_CRC: u32 = 5
+
+/// A streaming gzip decoder. Make one with `decoder(limits)`.
+pub type Decoder = {
+    lim: compression.Limits, inf: deflate.Inflater, phase: u32,
+    hstate: u32, hflg: u8, hraw: List[u8], hcnt: usize, xlen: usize,
+    trail: List[u8], crc: ck.Crc32, info: Header,
+    members: u64, multi: bool, fed: u64, out_before: u64, in_before: u64,
+    err: Option[compression.Error],
+}
+
+pub fn decoder(lim: compression.Limits) -> Decoder {
+    Decoder(lim, deflate.inflater(lim), PH_HEADER, H_FIXED, 0, List.new(), 0, 0,
+            List.new(), ck.crc32_new(), empty_header(), 0, true, 0, 0, 0, None)
+}
+
+fn fail_at(inout d: Decoder, kind: compression.Kind, msg: str, off: u64) -> compression.Error {
+    d.phase = PH_FAILED
+    let e = compression.error(kind, msg, off)
+    d.err = Some(e.copy())
+    e
+}
+
+impl Decoder {
+    /// Reads only one member; input after it is a `Trailing` error.
+    fn single_member(inout self) { self.multi = false }
+
+    /// At least one member was read completely and nothing is half read.
+    fn done(self) -> bool { self.phase == PH_BETWEEN }
+
+    /// The header of the member being read, or of the last one read.
+    fn header(self) -> Header { self.info.copy() }
+
+    /// Members read completely so far.
+    fn members(self) -> u64 { self.members }
+
+    /// Bytes decoded so far.
+    fn produced(self) -> u64 { self.out_before + self.inf.produced() }
+
+    fn failed(self) -> compression.Error {
+        match self.err {
+            Some(e) => e.copy()
+            None => compression.error(compression.Closed, "gzip: decoder already failed", self.fed)
+        }
+    }
+
+    // Starts a header.
+    fn begin_header(inout self) {
+        self.phase = PH_HEADER
+        self.hstate = H_FIXED
+        self.hflg = 0
+        self.hraw.clear()
+        self.hcnt = 0
+        self.info = empty_header()
+    }
+
+    // The state after the part `done` of the header, by the flags; H_FIXED means "header over".
+    fn after(self, done: u32) -> u32 {
+        let f = self.hflg.copy()
+        if done == H_FIXED && (f & 4) != 0 { return H_XLEN }
+        if done <= H_EXTRA && (f & 8) != 0 { return H_NAME }
+        if done <= H_NAME && (f & 16) != 0 { return H_COMMENT }
+        if done <= H_COMMENT && (f & 2) != 0 { return H_CRC }
+        H_FIXED
+    }
+
+    // Reads header bytes from data[i..]; true when the header is complete.
+    fn read_header(inout self, data: List[u8], inout i: usize, base: u64) -> Result[bool, compression.Error] {
+        let n = data.len()
+        while i < n {
+            let b = data[i].copy()
+            let at = base + (i as u64)
+            if self.lim.max_header != 0 && (self.hraw.len() as u64) >= self.lim.max_header {
+                return Err(fail_at(inout self, compression.TooLarge, "gzip: header too large", at))
+            }
+            i += 1
+            if self.hstate == H_FIXED {
+                self.hraw.push(b)
+                let k = self.hraw.len()
+                if (k == 1 && b != 31) || (k == 2 && b != 139) {
+                    if self.members > 0 { return Err(fail_at(inout self, compression.Trailing, "gzip: garbage after the last member", at)) }
+                    return Err(fail_at(inout self, compression.Corrupt, "gzip: bad magic number", at))
+                }
+                if k == 3 && b != 8 {
+                    return Err(fail_at(inout self, compression.Unsupported, "gzip: compression method is not deflate", at))
+                }
+                if k == 4 {
+                    if (b & 224) != 0 {
+                        return Err(fail_at(inout self, compression.Unsupported, "gzip: reserved flag bits are set", at))
+                    }
+                    self.hflg = b
+                    self.info.text = (b & 1) != 0
+                }
+                if k == 10 {
+                    let r = self.hraw.copy()
+                    self.info.mtime = (r[4] as u32) | ((r[5] as u32) << 8) | ((r[6] as u32) << 16) | ((r[7] as u32) << 24)
+                    self.info.xfl = r[8].copy()
+                    self.info.os = r[9].copy()
+                    self.hcnt = 0
+                    let next = self.after(H_FIXED)
+                    if next == H_FIXED { return Ok(true) }
+                    self.hstate = next
+                }
+            } else if self.hstate == H_XLEN {
+                self.hraw.push(b)
+                self.hcnt += 1
+                if self.hcnt == 1 {
+                    self.xlen = b as usize
+                } else {
+                    self.xlen = self.xlen | ((b as usize) << 8)
+                    self.hcnt = 0
+                    if self.xlen == 0 {
+                        let next = self.after(H_EXTRA)
+                        if next == H_FIXED { return Ok(true) }
+                        self.hstate = next
+                    } else {
+                        self.hstate = H_EXTRA
+                    }
+                }
+            } else if self.hstate == H_EXTRA {
+                self.hraw.push(b)
+                self.info.extra.push(b)
+                self.hcnt += 1
+                if self.hcnt == self.xlen {
+                    let next = self.after(H_EXTRA)
+                    if next == H_FIXED { return Ok(true) }
+                    self.hstate = next
+                }
+            } else if self.hstate == H_NAME {
+                self.hraw.push(b)
+                if b == 0 {
+                    let next = self.after(H_NAME)
+                    if next == H_FIXED { return Ok(true) }
+                    self.hstate = next
+                } else {
+                    self.info.name.push(b)
+                }
+            } else if self.hstate == H_COMMENT {
+                self.hraw.push(b)
+                if b == 0 {
+                    let next = self.after(H_COMMENT)
+                    if next == H_FIXED { return Ok(true) }
+                    self.hstate = next
+                } else {
+                    self.info.comment.push(b)
+                }
+            } else {
+                // H_CRC: two bytes, the low half of the CRC-32 of everything before them
+                self.hcnt += 1
+                if self.hcnt == 1 {
+                    self.xlen = b as usize
+                } else {
+                    let want = (self.xlen as u32) | ((b as u32) << 8)
+                    let have = ck.crc32(self.hraw) & 65535
+                    if want != have {
+                        return Err(fail_at(inout self, compression.Checksum, "gzip: header CRC mismatch", at))
+                    }
+                    return Ok(true)
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Adds a chunk of input and appends what it decodes to `out`. After an `Err` the decoder is
+    /// finished (later calls return the same error). Errors carry the offset in the input fed.
+    fn feed(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        if self.phase == PH_FAILED { return Err(self.failed()) }
+        let n = data.len()
+        let base = self.fed.copy()
+        self.fed += n as u64
+        let mut i: usize = 0
+        while i < n {
+            if self.phase == PH_BETWEEN {
+                // another member, or zero padding
+                if data[i] == 0 {
+                    i += 1
+                    continue
+                }
+                if !self.multi {
+                    return Err(fail_at(inout self, compression.Trailing, "gzip: data after the end of the member", base + (i as u64)))
+                }
+                self.begin_header()
+            }
+            if self.phase == PH_HEADER {
+                let complete = self.read_header(data, inout i, base)?
+                if !complete { return Ok(()) }
+                // a new member: its own deflate stream, with what is left of the output budget
+                let mut l = self.lim.copy()
+                if l.max_output != 0 {
+                    l.max_output = if l.max_output > self.out_before { l.max_output - self.out_before } else { 1 }
+                }
+                self.inf.reset(l)
+                self.crc.reset()
+                self.in_before = base + (i as u64)
+                self.phase = PH_BODY
+                continue
+            }
+            if self.phase == PH_BODY {
+                let start = out.len()
+                let r = self.inf.feed_from(data, i, inout out)
+                self.crc.update_range(out, start, out.len())
+                match r {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let at = compression.Error(e.kind, e.message.copy(), self.in_before + e.offset)
+                        self.phase = PH_FAILED
+                        self.err = Some(at.copy())
+                        return Err(at)
+                    }
+                }
+                if self.inf.done() {
+                    i = ((self.in_before + self.inf.consumed()) - base) as usize
+                    self.out_before += self.inf.produced()
+                    self.phase = PH_TRAILER
+                    self.trail.clear()
+                } else {
+                    i = n
+                }
+                continue
+            }
+            if self.phase == PH_TRAILER {
+                while i < n && self.trail.len() < 8 {
+                    self.trail.push(data[i])
+                    i += 1
+                }
+                if self.trail.len() == 8 {
+                    let t = self.trail.copy()
+                    let crc = (t[0] as u32) | ((t[1] as u32) << 8) | ((t[2] as u32) << 16) | ((t[3] as u32) << 24)
+                    let size = (t[4] as u32) | ((t[5] as u32) << 8) | ((t[6] as u32) << 16) | ((t[7] as u32) << 24)
+                    let at = base + (i as u64)
+                    if crc != self.crc.value() {
+                        return Err(fail_at(inout self, compression.Checksum, "gzip: CRC-32 mismatch", at))
+                    }
+                    if size != ((self.crc.count() & 4294967295) as u32) {
+                        return Err(fail_at(inout self, compression.Checksum, "gzip: length mismatch", at))
+                    }
+                    self.members += 1
+                    self.phase = PH_BETWEEN
+                }
+                continue
+            }
+        }
+        Ok(())
+    }
+
+    /// No more input: Ok if every member is complete (and there was one), else `Truncated`.
+    fn finish(inout self) -> Result[(), compression.Error] {
+        if self.phase == PH_FAILED { return Err(self.failed()) }
+        if self.phase == PH_BETWEEN { return Ok(()) }
+        let at = self.fed.copy()
+        Err(fail_at(inout self, compression.Truncated, "gzip: stream ends before the end of the member", at))
+    }
+}
+
+/// Decodes gzip data (all members) with the default limits.
+pub fn decompress(data: List[u8]) -> Result[List[u8], compression.Error] {
+    decompress_with(data, compression.limits())
+}
+
+pub fn decompress_with(data: List[u8], lim: compression.Limits) -> Result[List[u8], compression.Error] {
+    let mut d = decoder(lim)
+    let mut out: List[u8] = List.new()
+    d.feed(data, inout out)?
+    d.finish()?
+    Ok(out)
+}
+
+/// A streaming gzip encoder. Make one with `encoder(level)`.
+pub type Encoder = { def: deflate.Deflater, crc: ck.Crc32, started: bool, head: Header, mtime_set: bool }
+
+pub fn encoder(level: i32) -> Encoder {
+    Encoder(deflate.deflater(level), ck.crc32_new(), false, empty_header(), false)
+}
+
+impl Encoder {
+    /// The file name to put in the header (before the first `write`).
+    fn set_name(inout self, name: List[u8]) { self.head.name = name.copy() }
+
+    /// A comment for the header.
+    fn set_comment(inout self, comment: List[u8]) { self.head.comment = comment.copy() }
+
+    /// The modification time (seconds since 1970) for the header; the default is 0 (unknown), so
+    /// the output is reproducible.
+    fn set_mtime(inout self, t: u32) { self.head.mtime = t }
+
+    fn header(inout self, inout out: List[u8]) {
+        if self.started { return }
+        self.started = true
+        let mut flg: u8 = 0
+        if self.head.name.len() > 0 { flg = flg | 8 }
+        if self.head.comment.len() > 0 { flg = flg | 16 }
+        out.push(31)
+        out.push(139)
+        out.push(8)
+        out.push(flg)
+        let t = self.head.mtime.copy()
+        out.push((t & 255) as u8)
+        out.push(((t >> 8) & 255) as u8)
+        out.push(((t >> 16) & 255) as u8)
+        out.push((t >> 24) as u8)
+        let lv = self.def.level.copy()
+        out.push(if lv == 9 { 2 } else if lv == 1 { 4 } else { 0 })
+        out.push(255)
+        if self.head.name.len() > 0 {
+            for b in self.head.name {
+                if b != 0 { out.push(b) }
+            }
+            out.push(0)
+        }
+        if self.head.comment.len() > 0 {
+            for b in self.head.comment {
+                if b != 0 { out.push(b) }
+            }
+            out.push(0)
+        }
+    }
+
+    /// Compresses `data`; appends what is ready to `out`.
+    fn write(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        self.header(inout out)
+        self.crc.update(data)
+        self.def.write(data, inout out)
+    }
+
+    /// A sync flush (see `deflate.Deflater.flush`).
+    fn flush(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        self.header(inout out)
+        self.def.flush(inout out)
+    }
+
+    /// Ends the member: the last block, the CRC-32 and the length.
+    fn finish(inout self, inout out: List[u8]) -> Result[(), compression.Error] {
+        self.header(inout out)
+        self.def.finish(inout out)?
+        let c = self.crc.value()
+        let n = (self.crc.count() & 4294967295) as u32
+        out.push((c & 255) as u8)
+        out.push(((c >> 8) & 255) as u8)
+        out.push(((c >> 16) & 255) as u8)
+        out.push((c >> 24) as u8)
+        out.push((n & 255) as u8)
+        out.push(((n >> 8) & 255) as u8)
+        out.push(((n >> 16) & 255) as u8)
+        out.push((n >> 24) as u8)
+        Ok(())
+    }
+
+    fn finished(self) -> bool { self.def.finished() }
+}
+
+/// Compresses `data` to a gzip member; `level` is 0 to 9 (6 is the default, -1 means it).
+pub fn compress(data: List[u8], level: i32) -> List[u8] {
+    let mut e = encoder(level)
+    let mut out: List[u8] = List.new()
+    match e.write(data, inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match e.finish(inout out) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    out
+}

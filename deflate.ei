@@ -14,7 +14,6 @@
 //! decoding for the rare longer ones. The encoder builds length-limited (15 bit) codes for
 //! every block and picks stored, fixed or dynamic, whichever is smallest.
 
-import std.checked
 import std.sort
 import compression
 import compression.checksum as ck
@@ -197,25 +196,14 @@ fn fail(inout s: Inflater, kind: compression.Kind, msg: str) -> compression.Erro
     e
 }
 
-fn cap_for(lim: compression.Limits, fed: u64) -> u64 {
-    let mut cap: u64 = 18446744073709551615
-    if lim.max_output != 0 { cap = lim.max_output.copy() }
-    if lim.max_ratio != 0 {
-        let by_ratio = match fed.checked_mul(lim.max_ratio) {
-            Some(v) => if v < lim.ratio_floor { lim.ratio_floor.copy() } else { v }
-            None => 18446744073709551615
-        }
-        if by_ratio < cap { cap = by_ratio }
-    }
-    cap
-}
+fn cap_for(lim: compression.Limits, fed: u64) -> u64 { compression.output_cap(lim, fed) }
 
 /// Why output of `produced` bytes passes the limits (TooLarge, or the ratio).
 fn over(inout s: Inflater) -> compression.Error {
-    if s.lim.max_output != 0 && cap_for(s.lim, s.fed) == s.lim.max_output {
-        return fail(inout s, compression.TooLarge, "deflate: output over the limit")
-    }
-    fail(inout s, compression.RatioExceeded, "deflate: output over the ratio limit")
+    let e = compression.over_error(s.lim, s.fed, "deflate", s.offset())
+    s.state = ST_FAILED
+    s.err = Some(e.copy())
+    e
 }
 
 impl Inflater {
@@ -276,21 +264,44 @@ impl Inflater {
     /// After an `Err` the decoder is finished (later calls say `Closed`); output produced
     /// before the error is in `out`. After the final block, further input is kept in `rest()`.
     fn feed(inout self, data: List[u8], inout out: List[u8]) -> Result[(), compression.Error] {
+        self.feed_from(data, 0, inout out)
+    }
+
+    /// `feed` for `data[from ..]`, without copying it.
+    fn feed_from(inout self, data: List[u8], from: usize, inout out: List[u8]) -> Result[(), compression.Error] {
         if self.state == ST_FAILED { return Err(self.closed()) }
         if self.pos >= self.inp.len() {
             self.inp = data.copy()
-            self.pos = 0
-        } else if data.len() > 0 {
+            self.pos = from.copy()
+        } else if data.len() > from {
             if self.pos > 0 {
                 self.inp.remove_range(0, self.pos)
                 self.pos = 0
             }
-            self.inp.extend(data)
+            self.inp.extend(data.slice(from, data.len()))
         }
-        self.fed += data.len() as u64
+        self.fed += (data.len() - from) as u64
         let r = self.run()
         if !self.keep { self.flush_into(inout out) }
         r
+    }
+
+    /// Starts a new stream (same limits, no dictionary): the decoder is reused with its tables.
+    fn reset(inout self, lim: compression.Limits) {
+        self.lim = lim
+        self.inp = List.new()
+        self.pos = 0
+        self.bb = 0
+        self.bc = 0
+        self.state = ST_HEADER
+        self.last = false
+        self.hist.clear()
+        self.flushed = 0
+        self.out_total = 0
+        self.dict_len = 0
+        self.stored_left = 0
+        self.fed = 0
+        self.err = None
     }
 
     fn closed(self) -> compression.Error {

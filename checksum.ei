@@ -28,10 +28,13 @@ pub fn crc32_new() -> Crc32 { Crc32(crc_tables(), 0xFFFFFFFF, 0) }
 
 impl Crc32 {
     /// Adds bytes.
-    fn update(inout self, data: List[u8]) {
+    fn update(inout self, data: List[u8]) { self.update_range(data, 0, data.len()) }
+
+    /// Adds `data[from .. to]`.
+    fn update_range(inout self, data: List[u8], from: usize, to: usize) {
         let mut c = self.c.copy()
-        let len = data.len()
-        let mut i: usize = 0
+        let len = to.copy()
+        let mut i = from.copy()
         while i + 4 <= len {
             c = c ^ ((data[i] as u32) | ((data[i + 1] as u32) << 8) | ((data[i + 2] as u32) << 16) | ((data[i + 3] as u32) << 24))
             c = self.t[768 + (c & 0xFF) as usize] ^ self.t[512 + ((c >> 8) & 0xFF) as usize] ^ self.t[256 + ((c >> 16) & 0xFF) as usize] ^ self.t[(c >> 24) as usize]
@@ -42,7 +45,7 @@ impl Crc32 {
             i += 1
         }
         self.c = c
-        self.n += len as u64
+        self.n += (to - from) as u64
     }
 
     /// The CRC of the bytes added so far.
@@ -70,11 +73,14 @@ pub type Adler32 = { a: u32, b: u32 }
 pub fn adler32_new() -> Adler32 { Adler32(1, 0) }
 
 impl Adler32 {
-    fn update(inout self, data: List[u8]) {
+    fn update(inout self, data: List[u8]) { self.update_range(data, 0, data.len()) }
+
+    /// Adds `data[from .. to]`.
+    fn update_range(inout self, data: List[u8], from: usize, to: usize) {
         let mut a = self.a.copy()
         let mut b = self.b.copy()
-        let len = data.len()
-        let mut i: usize = 0
+        let len = to.copy()
+        let mut i = from.copy()
         while i < len {
             // 5552 is the most bytes that cannot overflow a u32 before the reduction
             let mut stop = i + 5552
@@ -142,10 +148,13 @@ pub fn xxh64_new() -> Xxh64 {
 }
 
 impl Xxh64 {
-    fn update(inout self, data: List[u8]) {
-        let len = data.len()
-        self.total += len as u64
-        let mut i: usize = 0
+    fn update(inout self, data: List[u8]) { self.update_range(data, 0, data.len()) }
+
+    /// Adds `data[from .. to]`.
+    fn update_range(inout self, data: List[u8], from: usize, to: usize) {
+        let len = to.copy()
+        self.total += (to - from) as u64
+        let mut i = from.copy()
         if self.buf.len() > 0 {
             while i < len && self.buf.len() < 32 {
                 self.buf.push(data[i])

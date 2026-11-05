@@ -11,6 +11,9 @@ import std.strings
 import std.time
 import compression
 import compression.deflate
+import compression.gzip
+import compression.zlib
+import compression.zstd
 
 fn text(b: List[u8]) -> String {
     match String.from_bytes(b) {
@@ -40,6 +43,25 @@ fn main() uses io, fs, clock {
     let mut err = String.from("")
     if cmd == String.from("inflate") {
         match deflate.inflate_with(data, compression.unlimited()) {
+            Ok(o) => { out = o }
+            Err(e) => { err = e.to_string() }
+        }
+    } else if cmd == String.from("gunzip") {
+        match gzip.decompress_with(data, compression.unlimited()) {
+            Ok(o) => { out = o }
+            Err(e) => { err = e.to_string() }
+        }
+    } else if cmd == String.from("unzlib") {
+        match zlib.decompress_with(data, compression.unlimited()) {
+            Ok(o) => { out = o }
+            Err(e) => { err = e.to_string() }
+        }
+    } else if cmd == String.from("gzip") {
+        out = gzip.compress(data, strings.parse_i32(lvl).unwrap())
+    } else if cmd == String.from("zlib") {
+        out = zlib.compress(data, strings.parse_i32(lvl).unwrap())
+    } else if cmd == String.from("unzstd") {
+        match zstd.decompress_with(data, compression.unlimited()) {
             Ok(o) => { out = o }
             Err(e) => { err = e.to_string() }
         }
