@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+For Eider 0.7.10. No library change. The tests skip their ThreadSanitizer runs when TSan cannot follow `longjmp` (glibc 2.4x), as they do for a missing runtime; the 0.7.0 section of this file is corrected.
+
 ## 0.7.0
 
 First version (Eider 0.7.3, klxdev/eider-lang #37).
